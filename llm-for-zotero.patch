@@ -1,0 +1,875 @@
+diff --git a/addon/prefs.js b/addon/prefs.js
+index f07bc1f..a606fd1 100644
+--- a/addon/prefs.js
++++ b/addon/prefs.js
+@@ -1,6 +1,6 @@
+ pref("enable", true);
+ pref("logLevel", "warn");
+-pref("sidebarLayout", "stacked");
++pref("sidebarLayout", "independent");
+ pref("standaloneSidebarWidth", 220);
+ pref("standalonePinnedPapers", "");
+ pref("standaloneSidebarSectionOptions", "");
+diff --git a/package-lock.json b/package-lock.json
+index f9e1203..0a22530 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,12 +1,12 @@
+ {
+   "name": "llm-for-zotero",
+-  "version": "3.9.16",
++  "version": "3.9.16.20261108",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "llm-for-zotero",
+-      "version": "3.9.16",
++      "version": "3.9.16.20261108",
+       "hasInstallScript": true,
+       "license": "AGPL-3.0-or-later",
+       "dependencies": {
+diff --git a/package.json b/package.json
+index e8102d5..a64caa2 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "llm-for-zotero",
+   "type": "module",
+-  "version": "3.9.16",
++  "version": "3.9.16.20261108",
+   "description": "AI research agent rooted in your Zotero library",
+   "config": {
+     "addonName": "llm-for-zotero",
+diff --git a/src/modules/contextPanel/dedicatedChatPane.ts b/src/modules/contextPanel/dedicatedChatPane.ts
+index adcfeb7..f239dce 100644
+--- a/src/modules/contextPanel/dedicatedChatPane.ts
++++ b/src/modules/contextPanel/dedicatedChatPane.ts
+@@ -5,6 +5,7 @@ import {
+ import { installPersistentLibraryChatPane } from "./persistentLibraryChatPane";
+ import { getReaderContextPanelForTab } from "./readerPopupPanelRouting";
+ import { appLogger } from "../../core/logging";
++import { config } from "../../../package.json";
+ 
+ type TabSelectionObserver = {
+   registerObserver: (
+@@ -27,6 +28,89 @@ export function installDedicatedChatPane(
+ ): () => void {
+   const root = doc.documentElement;
+   const win = doc.defaultView;
++  const toolbarButtons = new Set<HTMLElement>();
++  let disposed = false;
++  const renderToolbar: _ZoteroTypes.Reader.EventHandler<"renderToolbar"> = ({
++    reader,
++    doc: readerDoc,
++    append,
++  }) => {
++    const readerWindow = (reader as unknown as { _window?: Window })._window;
++    if (readerWindow !== win) return;
++    if (disposed || readerDoc.getElementById("llm-reading-toolbar")) return;
++    const button = readerDoc.createElement("button");
++    button.id = "llm-reading-toolbar";
++    button.type = "button";
++    button.className = "toolbar-button";
++    button.title = "论文问答 · 自动读取当前 PDF 和当前页";
++    button.setAttribute("aria-label", button.title);
++    button.style.cssText =
++      "width:28px;height:28px;padding:4px;border:0;background:transparent;cursor:pointer";
++    button.textContent = "AI";
++    button.style.color = "#73b7ff";
++    button.style.fontWeight = "bold";
++    button.style.fontSize = "13px";
++    button.addEventListener("click", () => {
++      const host = getReaderContextPanelForTab(doc, reader.tabID);
++      const railButton = (
++        Array.from(
++          doc.querySelectorAll("item-pane-sidenav [data-pane]"),
++        ) as HTMLElement[]
++      ).find((candidate) => {
++        const rail = candidate.closest("item-pane-sidenav") as Element & {
++          container?: { getPane: (id: string) => Element | null };
++        };
++        const pane = rail.container?.getPane(candidate.dataset.pane || "");
++        return (
++          !!pane?.classList.contains("llm-dedicated-chat-pane") &&
++          !!host?.contains(pane)
++        );
++      });
++      if (railButton && win) {
++        railButton.dispatchEvent(
++          new (win as unknown as { MouseEvent: typeof MouseEvent }).MouseEvent(
++            "click",
++            {
++              bubbles: true,
++              detail: 1,
++              button: 0,
++            },
++          ),
++        );
++      }
++    });
++    toolbarButtons.add(button);
++    append(button);
++  };
++  Zotero.Reader?.registerEventListener?.(
++    "renderToolbar",
++    renderToolbar,
++    config.addonID,
++  );
++  for (const reader of Zotero.Reader?._readers || []) {
++    void Promise.resolve(
++      (reader as unknown as { _initPromise?: Promise<void> })._initPromise,
++    )
++      .then(() => {
++        if (disposed) return;
++        const readerDoc = reader._iframeWindow?.document;
++        const toolbar = readerDoc?.querySelector(
++          ".toolbar .end .custom-sections",
++        );
++        if (readerDoc && toolbar) {
++          renderToolbar({
++            reader,
++            doc: readerDoc,
++            params: {},
++            type: "renderToolbar",
++            append: (...nodes) => toolbar.append(...nodes),
++          });
++        }
++      })
++      .catch((error) =>
++        appLogger.warn("LLM: reader toolbar initialization failed", error),
++      );
++  }
+   let refreshTimer: number | undefined;
+   const refreshSelectedPane = () => {
+     if (!win) return;
+@@ -131,6 +215,10 @@ export function installDedicatedChatPane(
+     "llm-dedicated-chat-pane",
+   );
+   return () => {
++    disposed = true;
++    Zotero.Reader?.unregisterEventListener?.("renderToolbar", renderToolbar);
++    for (const button of toolbarButtons) button.remove();
++    toolbarButtons.clear();
+     libraryPane.dispose();
+     disposeLayout();
+     if (observerID) notifier?.unregisterObserver(observerID);
+diff --git a/src/services/pdf/pdfPageCapture.ts b/src/services/pdf/pdfPageCapture.ts
+index 82f74c1..f74773a 100644
+--- a/src/services/pdf/pdfPageCapture.ts
++++ b/src/services/pdf/pdfPageCapture.ts
+@@ -968,8 +968,10 @@ export async function renderPdfPageToBytes(
+  * The result is the same format as screenshots and can be pushed directly into
+  * `selectedImageCache` to be sent with the next message.
+  */
+-export async function captureCurrentPdfPage(): Promise<string | null> {
+-  const reader = getActiveReaderForSelectedTab();
++export async function captureCurrentPdfPage(
++  reader = getActiveReaderForSelectedTab(),
++  requestedPageNumber?: number,
++): Promise<string | null> {
+   if (!reader) return null;
+ 
+   const app = getPdfViewerApplication(reader);
+@@ -985,7 +987,7 @@ export async function captureCurrentPdfPage(): Promise<string | null> {
+     0,
+     Number.isFinite(rawPageNumber) ? Math.floor(rawPageNumber) - 1 : 0,
+   );
+-  const pageNumber = pageIndex + 1;
++  const pageNumber = requestedPageNumber ?? pageIndex + 1;
+ 
+   const renderedOffscreen = await renderPdfPageToDataUrl(
+     app,
+diff --git a/src/utils/i18n.ts b/src/utils/i18n.ts
+index 88f3ca1..113c38c 100644
+--- a/src/utils/i18n.ts
++++ b/src/utils/i18n.ts
+@@ -1878,13 +1878,13 @@ export function getWebChatWelcomeHtml(
+           <ol class="llm-start-page-rec-list">
+             <li>已经安装并启用 <strong>Sync for Zotero</strong> 浏览器扩展。</li>
+             <li>已经在 Chrome 或 Edge 中打开 <strong>${domain}</strong>，并且已经登录。</li>
+-            <li>保持 <strong>${domain}</strong> 标签页可见；不要最小化，不要放到另一个显示器。Zotero 模型标签旁的绿点表示已连接。</li>
++            <li>保持 <strong>${domain}</strong> 标签页打开并登录，可以留在后台。模型标签旁的绿点表示已连接。</li>
+           </ol>
+           <div class="llm-start-page-rec-title llm-webchat-rec-title-spaced">怎么提问</div>
+           <ol class="llm-start-page-rec-list">
+             <li>在这里输入问题并点击 <strong>Send</strong>。</li>
+-            <li>论文对话中，论文标签高亮表示下一轮会附加当前 PDF；未高亮时只发送提问。发送成功后，标签会自动切换为仅发送提问；之后随时可以右键论文标签重新附加当前 PDF。</li>
+-            <li>如果没有反应，请刷新 <strong>${domain}</strong> 标签页，确认扩展已启用，并让 Zotero 和浏览器保持在同一个显示器。</li>
++            <li>在 PDF 阅读器中提问时，会自动附上当前论文、当前页图像、页码及选中文字。已确认送达的同一篇论文会复用对话，避免反复上传全文。</li>
++            <li>如果网页登录过期，请重新登录；如果扩展失去响应，可刷新 <strong>${domain}</strong>。每次提问附上的是当时的论文页面快照。</li>
+           </ol>
+         </div>
+       </div>
+@@ -1903,13 +1903,13 @@ export function getWebChatWelcomeHtml(
+         <ol class="llm-start-page-rec-list">
+           <li>Install and enable the <strong>Sync for Zotero</strong> browser extension.</li>
+           <li>Open <strong>${domain}</strong> in Chrome or Edge, and make sure you are signed in.</li>
+-          <li>Keep the <strong>${domain}</strong> tab visible; do not minimize it or put it on another monitor. A green dot in Zotero's model chip means connected.</li>
++          <li>Keep the <strong>${domain}</strong> tab open and signed in. It can stay in the background. A green dot means connected.</li>
+         </ol>
+         <div class="llm-start-page-rec-title llm-webchat-rec-title-spaced">Ask from Zotero</div>
+         <ol class="llm-start-page-rec-list">
+           <li>Type your question here and press <strong>Send</strong>.</li>
+-          <li>For paper chat, a highlighted paper chip means the current PDF will be attached on the next turn; an unhighlighted chip sends only the prompt. After a successful send, the chip switches to prompt-only mode, and you can right-click it at any time to attach the current PDF again.</li>
+-          <li>If nothing happens, reload the <strong>${domain}</strong> tab, confirm the extension is enabled, and keep Zotero and the browser on the same monitor.</li>
++          <li>Questions from the PDF reader automatically include the current paper, page image, page number and selection. Verified paper conversations are reused without uploading the whole PDF again.</li>
++          <li>Sign in again if the web session expires. Reload <strong>${domain}</strong> if the extension stops responding. Each question includes a snapshot of the current PDF page.</li>
+         </ol>
+       </div>
+     </div>
+diff --git a/src/webchat/pipeline.ts b/src/webchat/pipeline.ts
+index bd3cfb7..1d1468f 100644
+--- a/src/webchat/pipeline.ts
++++ b/src/webchat/pipeline.ts
+@@ -2,14 +2,21 @@
+  * [webchat] Dedicated send pipeline for WebChat providers.
+  *
+  * Unlike the normal LLM pipeline, this:
+- *   - Attaches the exact selected PDF when `sendPdf` is true (controlled by chip state)
+- *   - Sends only the raw question text (no system messages, no history)
++ *   - Automatically snapshots the current Zotero PDF and reading page
++ *   - Reuses only remote chats with a verified binding to that PDF
++ *   - Keeps explicit attachment behavior when no PDF reader is active
+  *   - Submits via the embedded Zotero relay → Chrome extension → provider site
+  */
+ 
+ import { appLogger } from "../core/logging";
+ import { readLocalFileBytes } from "../utils/llmClient";
+ import { isAbsoluteLocalPath } from "../utils/localPath";
++import {
++  captureWebChatReadingContext,
++  getReadingConversationBinding,
++  readingBindingMatches,
++  saveReadingConversationBinding,
++} from "./readingContext";
+ import type { PaperContextRef } from "../modules/contextPanel/types";
+ import {
+   getZoteroAttachmentFilename,
+@@ -184,8 +191,9 @@ export function selectWebChatExpectedConversation(input: {
+ 
+ /**
+  * Send a question to a registered web provider via the embedded Zotero relay.
+- * Attaches the exact selected paper PDF only when `sendPdf` is true.
+- * The caller determines whether to send PDF based on the paper chip state.
++ * Reader questions automatically include the current page image and text.
++ * The full PDF is uploaded once per verified remote conversation; non-reader
++ * questions retain the caller's explicit attachment and conversation choices.
+  *
+  * Returns the final response text.
+  */
+@@ -208,14 +216,49 @@ export async function sendWebChatQuestion(
+     onThinkingSnapshot,
+   } = opts;
+ 
+-  appLogger.debug(`[webchat] sendWebChatQuestion: sendPdf=${sendPdf}`);
++  const reading = await captureWebChatReadingContext();
++  const bindingScope = `${opts.item.libraryID}:${opts.item.key || opts.item.id}:${target || "chatgpt"}`;
++  const binding = reading ? getReadingConversationBinding(bindingScope) : null;
++  const reuseReadingConversation = Boolean(
++    reading &&
++    !forceNewChat &&
++    readingBindingMatches(
++      binding,
++      reading.paperIdentity,
++      expectedChatUrl,
++      expectedChatId,
++    ),
++  );
++  const attachPdf = reading
++    ? !reuseReadingConversation || sendPdf === true
++    : sendPdf;
++  const resolvedContexts = reading ? [reading.paper] : pdfPaperContexts;
++  const resolvedForceNewChat = reading
++    ? !reuseReadingConversation
++    : forceNewChat;
++  const resolvedChatUrl = reading
++    ? reuseReadingConversation
++      ? binding!.chatUrl
++      : undefined
++    : expectedChatUrl;
++  const resolvedChatId = reading
++    ? reuseReadingConversation
++      ? binding!.chatId
++      : undefined
++    : expectedChatId;
++  const resolvedQuestion = reading
++    ? `${reading.prompt}\n\nUser question:\n${question}`
++    : question;
++  const resolvedImages = reading ? [...(images || []), reading.image] : images;
++
++  appLogger.debug(`[webchat] sendWebChatQuestion: sendPdf=${attachPdf}`);
+ 
+-  // --- Resolve and read the current paper's PDF (only when explicitly requested) ---
++  // Resolve the exact attachment before submitting any request to the relay.
+   let pdfBase64: string | null = null;
+   let pdfFilename: string | null = null;
+ 
+-  if (sendPdf) {
+-    const pdfs = await resolveSelectedWebChatPdfBatch(pdfPaperContexts || []);
++  if (attachPdf) {
++    const pdfs = await resolveSelectedWebChatPdfBatch(resolvedContexts || []);
+     if (pdfs.length !== 1) {
+       throw new Error(
+         "WebChat supports exactly one selected PDF attachment per send.",
+@@ -244,28 +287,44 @@ export async function sendWebChatQuestion(
+   // If the extension is still navigating to a loaded history item or a fresh
+   // chat, wait for the remote composer/transcript to settle before submitting.
+   await waitForRemoteReadyIfNavigating(host, signal);
++  reading?.assertCurrent();
+ 
+   // --- Submit to the embedded relay ---
+   const { seq } = await submitQuery(
+     host,
+-    question,
++    resolvedQuestion,
+     pdfBase64,
+     pdfFilename,
+     signal,
+-    images,
++    resolvedImages,
+     chatgptMode,
+-    forceNewChat,
++    resolvedForceNewChat,
+     target,
+-    expectedChatUrl,
+-    expectedChatId,
++    resolvedChatUrl,
++    resolvedChatId,
+   );
+ 
+   // --- Poll for streaming response ---
+-  return pollForResponse(
++  const result = await pollForResponse(
+     host,
+     seq,
+     onAnswerSnapshot,
+     onThinkingSnapshot,
+     signal,
+   );
++  if (reading && result.runState === "done" && result.remoteChatUrl) {
++    try {
++      saveReadingConversationBinding(bindingScope, {
++        paperIdentity: reading.paperIdentity,
++        chatUrl: result.remoteChatUrl,
++        chatId: result.remoteChatId,
++      });
++    } catch (error) {
++      appLogger.warn(
++        "Could not cache the verified WebChat paper binding",
++        error,
++      );
++    }
++  }
++  return result;
+ }
+diff --git a/src/webchat/preloadScreen.ts b/src/webchat/preloadScreen.ts
+index 6e88a44..08b3196 100644
+--- a/src/webchat/preloadScreen.ts
++++ b/src/webchat/preloadScreen.ts
+@@ -11,7 +11,6 @@ import {
+   relayGetExtensionLiveness,
+   relayGetExtensionStatus,
+   relayGetExtensionReadinessError,
+-  relayClearExtensionStatus,
+ } from "./relayServer";
+ import {
+   WEBCHAT_TARGETS,
+@@ -160,8 +159,12 @@ export async function showWebChatPreloadScreen(
+   const doc = chatShell.ownerDocument!;
+   const siteName = targetLabel || "ChatGPT";
+ 
+-  // Clear stale extension status so we wait for a fresh heartbeat
+-  relayClearExtensionStatus();
++  // Reuse a still-fresh, verified status when a panel is reopened. The relay
++  // getters enforce expiry and provider/delivery-contract readiness.
++  if (STEPS.every((step) => step.check()) && makeChatSiteStep(targetHost).check()) {
++    chatShell.querySelector(".llm-webchat-preload")?.remove();
++    return;
++  }
+ 
+   // Remove any leftover preload overlay
+   chatShell.querySelector(".llm-webchat-preload")?.remove();
+diff --git a/src/webchat/readingContext.ts b/src/webchat/readingContext.ts
+new file mode 100644
+index 0000000..3e7d4f1
+--- /dev/null
++++ b/src/webchat/readingContext.ts
+@@ -0,0 +1,196 @@
++import { config } from "../../package.json";
++import type { PaperContextRef } from "../modules/contextPanel/types";
++import {
++  captureCurrentPdfPage,
++  getPdfViewerApplication,
++} from "../services/pdf/pdfPageCapture";
++import { getActiveReaderForSelectedTab } from "../services/pdf/zoteroReaderTabs";
++import { getFirstSelectionFromReader } from "../services/pdf/readerSelection";
++
++const BINDINGS_PREF = `${config.prefsPrefix}.webchatReadingBindings`;
++
++export type ReadingConversationBinding = {
++  paperIdentity: string;
++  chatUrl: string;
++  chatId: string | null;
++};
++
++export type WebChatReadingContext = {
++  paper: PaperContextRef;
++  paperIdentity: string;
++  image: string;
++  prompt: string;
++  assertCurrent: () => void;
++};
++
++function currentPageNumber(app: any): number {
++  const value = Number(app?.pdfViewer?.currentPageNumber || app?.page);
++  if (!Number.isSafeInteger(value) || value < 1) {
++    throw new Error(
++      "Cannot identify the current Zotero PDF page. Please wait for the page to load.",
++    );
++  }
++  return value;
++}
++
++function unwrapPdfObject(value: any): any {
++  try {
++    return value?.wrappedJSObject || value;
++  } catch {
++    return value;
++  }
++}
++
++async function readPageText(
++  pdfDocument: any,
++  pageNumber: number,
++): Promise<string> {
++  try {
++    const page = unwrapPdfObject(await pdfDocument.getPage(pageNumber));
++    if (typeof page?.getTextContent !== "function") return "";
++    const content = unwrapPdfObject(await page.getTextContent());
++    return Array.from(content?.items || [])
++      .map((entry) => String(unwrapPdfObject(entry)?.str || ""))
++      .join(" ")
++      .slice(0, 18000);
++  } catch {
++    // Some Zotero PDF.js wrappers expose rendering but not text extraction.
++    // The mandatory page image remains the source in that case.
++    return "";
++  }
++}
++
++/** Snapshot only the selected Zotero PDF, never another application or browser tab. */
++export async function captureWebChatReadingContext(): Promise<WebChatReadingContext | null> {
++  const reader = getActiveReaderForSelectedTab();
++  if (!reader) return null;
++  const attachmentId = Number(reader.itemID || reader._item?.id);
++  const attachment = Zotero.Items.get(attachmentId);
++  if (
++    !attachment?.isAttachment?.() ||
++    attachment.attachmentContentType !== "application/pdf"
++  ) {
++    return null;
++  }
++  const app = getPdfViewerApplication(reader);
++  if (!app?.pdfDocument) {
++    throw new Error(
++      "The current Zotero PDF is still loading. Please retry when its page is visible.",
++    );
++  }
++  const pageNumber = currentPageNumber(app);
++  const pdfDocument = unwrapPdfObject(app.pdfDocument);
++  const parent = attachment.parentID
++    ? Zotero.Items.get(attachment.parentID)
++    : attachment;
++  const title = String(
++    parent?.getField("title") ||
++      attachment.getField("title") ||
++      "Current Zotero PDF",
++  );
++  const fingerprints = pdfDocument.fingerprints || [
++    pdfDocument.fingerprint || "",
++  ];
++  const paperIdentity = `${attachment.libraryID}:${attachment.key}:${fingerprints.join(":")}`;
++  const assertCurrent = () => {
++    if (
++      getActiveReaderForSelectedTab() !== reader ||
++      currentPageNumber(app) !== pageNumber
++    ) {
++      throw new Error(
++        "The Zotero paper or page changed while preparing this question. Please send it again on the page you want to discuss.",
++      );
++    }
++  };
++  const selected = getFirstSelectionFromReader(reader, (text) => text.trim());
++  const text = await readPageText(pdfDocument, pageNumber);
++  const image = await captureCurrentPdfPage(reader, pageNumber);
++  if (!image) {
++    throw new Error(
++      "Could not capture the current Zotero PDF page. Please wait for it to render and retry.",
++    );
++  }
++  assertCurrent();
++  const label = String(app.pdfViewer?.currentPageLabel || pageNumber);
++  return {
++    paper: {
++      itemId: parent?.id || attachment.id,
++      contextItemId: attachment.id,
++      libraryID: attachment.libraryID,
++      title,
++      contentSourceMode: "pdf",
++    },
++    paperIdentity,
++    image,
++    assertCurrent,
++    prompt: [
++      "[Current Zotero reading context, captured when this question was sent]",
++      `Paper: ${title}`,
++      `PDF page: ${pageNumber} of ${pdfDocument.numPages}; displayed page label: ${label}.`,
++      "The attached page image is the current page of this Zotero PDF. Use this paper and page as the reading context. Browser tabs are unrelated. This is a page snapshot, not a continuous live screen stream.",
++      selected ? `Selected passage: ${selected}` : "",
++      text
++        ? `Current page text (possibly truncated):\n${text}`
++        : "Page text extraction is unavailable. Read the attached page image.",
++      "[End of reading context]",
++    ]
++      .filter(Boolean)
++      .join("\n\n"),
++  };
++}
++
++export function getReadingConversationBinding(
++  scope: string,
++): ReadingConversationBinding | null {
++  try {
++    const records = JSON.parse(
++      String(Zotero.Prefs.get(BINDINGS_PREF, true) || "{}"),
++    );
++    const value = records[scope];
++    return value &&
++      typeof value.paperIdentity === "string" &&
++      typeof value.chatUrl === "string" &&
++      value.chatUrl
++      ? value
++      : null;
++  } catch {
++    return null;
++  }
++}
++
++export function saveReadingConversationBinding(
++  scope: string,
++  binding: ReadingConversationBinding,
++): void {
++  let records: Record<string, ReadingConversationBinding> = {};
++  try {
++    const parsed = JSON.parse(
++      String(Zotero.Prefs.get(BINDINGS_PREF, true) || "{}"),
++    );
++    if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
++      records = parsed;
++  } catch {
++    /* A missing or corrupt cache must not prevent a verified answer from being saved. */
++  }
++  delete records[scope];
++  records[scope] = binding;
++  Zotero.Prefs.set(
++    BINDINGS_PREF,
++    JSON.stringify(Object.fromEntries(Object.entries(records).slice(-100))),
++    true,
++  );
++}
++
++export function readingBindingMatches(
++  binding: ReadingConversationBinding | null,
++  paperIdentity: string,
++  expectedUrl?: string | null,
++  expectedId?: string | null,
++): binding is ReadingConversationBinding {
++  return Boolean(
++    binding &&
++    binding.paperIdentity === paperIdentity &&
++    (!expectedUrl || expectedUrl === binding.chatUrl) &&
++    (!expectedId || expectedId === binding.chatId),
++  );
++}
+diff --git a/test/webchatReadingContext.test.ts b/test/webchatReadingContext.test.ts
+new file mode 100644
+index 0000000..a7026b4
+--- /dev/null
++++ b/test/webchatReadingContext.test.ts
+@@ -0,0 +1,274 @@
++import { assert } from "chai";
++import {
++  captureWebChatReadingContext,
++  getReadingConversationBinding,
++  readingBindingMatches,
++  saveReadingConversationBinding,
++} from "../src/webchat/readingContext";
++
++describe("automatic WebChat reading context", function () {
++  const originalZotero = globalThis.Zotero;
++  const originalIOUtils = (globalThis as any).IOUtils;
++  let selectedID: string;
++  let image: string | null;
++  let duringText: () => void;
++  let app: any;
++  let reader: any;
++  let preferences: Map<string, unknown>;
++
++  beforeEach(function () {
++    selectedID = "paper-a";
++    image = "data:image/png;base64,cGFnZS1mb3Vy";
++    duringText = () => {};
++    preferences = new Map();
++    const canvas = {
++      tagName: "CANVAS",
++      width: 800,
++      height: 1000,
++      getContext: () => null,
++      ownerDocument: { createElement: () => null },
++      toDataURL: () => image,
++    };
++    app = {
++      pdfViewer: {
++        currentPageNumber: 4,
++        currentPageLabel: "399",
++        getPageView: () => ({ canvas }),
++      },
++      pdfDocument: {
++        numPages: 30,
++        fingerprints: ["paper-a-fingerprint"],
++        getPage: async (pageNumber: number) => {
++          assert.equal(pageNumber, 4);
++          return {
++            getTextContent: async () => {
++              duringText();
++              return { items: [{ str: "Exact page four text" }] };
++            },
++          };
++        },
++      },
++    };
++    reader = { itemID: 101, _iframeWindow: { PDFViewerApplication: app } };
++    const items: Record<number, any> = {
++      10: {
++        id: 10,
++        key: "PAPER_A",
++        libraryID: 1,
++        getField: () => "Current paper",
++        isRegularItem: () => true,
++      },
++      101: {
++        id: 101,
++        libraryID: 1,
++        key: "PDF_A",
++        parentID: 10,
++        isAttachment: () => true,
++        attachmentContentType: "application/pdf",
++        getFilePathAsync: async () => "/papers/current.pdf",
++      },
++    };
++    (globalThis as any).Zotero = {
++      Tabs: {
++        get selectedID() {
++          return selectedID;
++        },
++      },
++      Reader: {
++        getByTabID: (id: string) => (id === "paper-a" ? reader : null),
++      },
++      Items: { get: (id: number) => items[id] },
++      Server: { Endpoints: {} },
++      Prefs: {
++        get: (key: string) => preferences.get(key),
++        set: (key: string, value: unknown) => preferences.set(key, value),
++      },
++    };
++  });
++
++  afterEach(function () {
++    (globalThis as any).Zotero = originalZotero;
++    (globalThis as any).IOUtils = originalIOUtils;
++  });
++
++  it("captures the exact PDF identity, displayed label, page image and page text", async function () {
++    const snapshot = await captureWebChatReadingContext();
++    assert.equal(snapshot?.paper.contextItemId, 101);
++    assert.equal(snapshot?.paper.itemId, 10);
++    assert.equal(snapshot?.image, image);
++    assert.include(
++      snapshot!.prompt,
++      "PDF page: 4 of 30; displayed page label: 399",
++    );
++    assert.include(snapshot!.prompt, "Exact page four text");
++  });
++
++  it("fails before submission when the visible page cannot be captured", async function () {
++    image = null;
++    let message = "";
++    try {
++      await captureWebChatReadingContext();
++    } catch (error) {
++      message = String(error);
++    }
++    assert.include(message, "Could not capture the current Zotero PDF page");
++  });
++
++  it("unwraps the PDF.js document, page and text content from Zotero Xray wrappers", async function () {
++    const pdfDocument = app.pdfDocument;
++    pdfDocument.getPage = async () => ({
++      wrappedJSObject: {
++        getTextContent: async () => ({
++          wrappedJSObject: {
++            items: [{ wrappedJSObject: { str: "Wrapped page text" } }],
++          },
++        }),
++      },
++    });
++    app.pdfDocument = { wrappedJSObject: pdfDocument };
++    const snapshot = await captureWebChatReadingContext();
++    assert.equal(snapshot?.image, image);
++    assert.include(snapshot!.prompt, "Wrapped page text");
++    assert.include(snapshot!.prompt, "PDF page: 4 of 30");
++  });
++
++  it("still sends the mandatory page image when PDF.js exposes no getTextContent", async function () {
++    app.pdfDocument.getPage = async () => ({});
++    const snapshot = await captureWebChatReadingContext();
++    assert.equal(snapshot?.image, image);
++    assert.include(snapshot!.prompt, "Read the attached page image");
++  });
++
++  it("still fails closed if both optional text extraction and mandatory screenshot fail", async function () {
++    app.pdfDocument.getPage = async () => ({});
++    image = null;
++    let message = "";
++    try {
++      await captureWebChatReadingContext();
++    } catch (error) {
++      message = String(error);
++    }
++    assert.include(message, "Could not capture the current Zotero PDF page");
++  });
++
++  it("rejects a paper switch while context is prepared", async function () {
++    duringText = () => {
++      selectedID = "paper-b";
++    };
++    let message = "";
++    try {
++      await captureWebChatReadingContext();
++    } catch (error) {
++      message = String(error);
++    }
++    assert.include(message, "paper or page changed");
++  });
++
++  it("rejects a page switch while context is prepared", async function () {
++    duringText = () => {
++      app.pdfViewer.currentPageNumber = 5;
++    };
++    let message = "";
++    try {
++      await captureWebChatReadingContext();
++    } catch (error) {
++      message = String(error);
++    }
++    assert.include(message, "paper or page changed");
++  });
++
++  it("reuses only a verified binding for the same PDF and remote conversation", function () {
++    const binding = {
++      paperIdentity: "pdf-a",
++      chatUrl: "https://chatgpt.com/c/a",
++      chatId: "a",
++    };
++    saveReadingConversationBinding("scope", binding);
++    const restored = getReadingConversationBinding("scope");
++    assert.isTrue(
++      readingBindingMatches(restored, "pdf-a", binding.chatUrl, "a"),
++    );
++    assert.isFalse(
++      readingBindingMatches(restored, "pdf-b", binding.chatUrl, "a"),
++    );
++    assert.isFalse(
++      readingBindingMatches(restored, "pdf-a", "https://chatgpt.com/c/b", "b"),
++    );
++    assert.isFalse(readingBindingMatches(null, "pdf-a", binding.chatUrl, "a"));
++  });
++
++  async function preparePendingSend(verifiedBinding: boolean) {
++    const relay = await import("../src/webchat/relayServer");
++    const pipeline = await import("../src/webchat/pipeline");
++    relay.relayResetForTests();
++    relay.relaySetExtensionCapabilitiesForTests([
++      relay.ATTACHMENT_DELIVERY_CONTRACT_VERSION,
++    ]);
++    const previousSeq = relay.relayGetStateSnapshot().query.seq;
++    (globalThis as any).IOUtils = {
++      read: async () => new TextEncoder().encode("%PDF-current"),
++    };
++    if (verifiedBinding) {
++      saveReadingConversationBinding("1:PAPER_A:chatgpt", {
++        paperIdentity: "1:PDF_A:paper-a-fingerprint",
++        chatUrl: "https://chatgpt.com/c/verified-paper",
++        chatId: "verified-paper",
++      });
++    }
++    const send = pipeline.sendWebChatQuestion({
++      item: Zotero.Items.get(10),
++      question: "Explain this page",
++      host: "http://127.0.0.1:23119/llm-for-zotero/webchat",
++      target: "chatgpt",
++      onAnswerSnapshot: () => {},
++      ...(verifiedBinding
++        ? {}
++        : {
++            expectedChatUrl: "https://chatgpt.com/c/unrelated",
++            expectedChatId: "unrelated",
++          }),
++    });
++    void send.catch(() => {});
++    for (
++      let attempt = 0;
++      attempt < 30 && relay.relayGetStateSnapshot().query.seq === previousSeq;
++      attempt++
++    ) {
++      await new Promise((resolve) => setTimeout(resolve, 0));
++    }
++    return { relay, send, query: relay.relayGetStateSnapshot().query };
++  }
++
++  it("automatically uploads the current PDF into a fresh chat and never binds an unfinished send", async function () {
++    const { relay, send, query } = await preparePendingSend(false);
++    try {
++      assert.equal(query.pdf_filename, "current.pdf");
++      assert.isNotNull(query.pdf_base64);
++      assert.isTrue(query.force_new_chat);
++      assert.isNull(query.expected_chat_url);
++      assert.deepEqual(query.images, [image]);
++      assert.include(query.prompt, "PDF page: 4 of 30");
++      assert.isNull(getReadingConversationBinding("1:PAPER_A:chatgpt"));
++    } finally {
++      relay.relayRequestStop();
++      await send.catch(() => {});
++    }
++    assert.isNull(getReadingConversationBinding("1:PAPER_A:chatgpt"));
++  });
++
++  it("restores a verified paper conversation without uploading the PDF again", async function () {
++    const { relay, send, query } = await preparePendingSend(true);
++    try {
++      assert.isNull(query.pdf_base64);
++      assert.isFalse(query.force_new_chat);
++      assert.equal(
++        query.expected_chat_url,
++        "https://chatgpt.com/c/verified-paper",
++      );
++      assert.deepEqual(query.images, [image]);
++    } finally {
++      relay.relayRequestStop();
++      await send.catch(() => {});
++    }
++  });
++});

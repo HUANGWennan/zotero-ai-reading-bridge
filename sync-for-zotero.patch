@@ -1,0 +1,934 @@
+diff --git a/extension/background.js b/extension/background.js
+index fc70e02..60246ef 100644
+--- a/extension/background.js
++++ b/extension/background.js
+@@ -1,3 +1,4 @@
++// Modified for Zotero AI Reading Bridge, November 2026.
+ /**
+  * background.js — Service Worker (Manifest V3)
+  *
+@@ -166,7 +167,8 @@ const MAX_PRE_SUBMIT_RELEASES = 3;
+ const MAX_CONTENT_SCRIPT_MESSAGE_ATTEMPTS = 3;
+ const CONTENT_SCRIPT_RECOVERY_TIMEOUT_MS = 30_000;
+ const RELAY_POLL_INTERVAL_MS = 500;
+-const HEARTBEAT_INTERVAL_MS = 10_000;
++const HEARTBEAT_INTERVAL_MS = 2_000;
++const HEARTBEAT_REQUEST_TIMEOUT_MS = 4_000;
+ const TAB_LOAD_TIMEOUT_MS = 120_000;
+ const PIPELINE_TIMEOUT_MS = 60 * 60_000;
+ const RELAY_ATTEMPT_WATCHDOG_INTERVAL_MS = 2_000;
+@@ -283,7 +285,9 @@ async function discoverZoteroPort() {
+       for (let port = 23119; port <= 23128; port++) {
+         try {
+           const candidateServer = `http://${host}:${port}/llm-for-zotero/webchat`;
+-          const res = await relayFetch(`${candidateServer}/debug`);
++          const res = await relayFetch(`${candidateServer}/debug`, {
++            signal: AbortSignal.timeout(HEARTBEAT_REQUEST_TIMEOUT_MS),
++          });
+           if (!res.ok) continue;
+           const data = await res.json();
+           // Verify this is actually our relay, not Zotero returning generic text
+@@ -307,7 +311,9 @@ async function discoverZoteroPort() {
+             // even when it comes back on the same port. Publish a fresh status
+             // immediately instead of waiting for an MV3 timer that may have
+             // been suspended with the service worker.
+-            await heartbeat();
++            // Discovery can itself be running inside the current heartbeat.
++            // In that case the next tick publishes the status.
++            if (!heartbeatInFlight) void heartbeat();
+             return;
+           }
+         } catch { /* try next host/port */ }
+@@ -337,10 +343,24 @@ function resetExtensionState() {
+   pollForQuery();
+ }
+ 
++// Share one probe across timer, tab events, and keepalive messages.
++let heartbeatInFlight = null;
++let lastChatRecoveryAt = 0;
++function heartbeat() {
++  if (!heartbeatInFlight) {
++    heartbeatInFlight = checkHeartbeat().finally(() => {
++      heartbeatInFlight = null;
++    });
++  }
++  return heartbeatInFlight;
++}
++
+ // Heartbeat: checks connectivity and triggers port rediscovery when needed
+-async function heartbeat() {
++async function checkHeartbeat() {
+   try {
+-    const res = await relayFetch(`${SERVER}/heartbeat`);
++    const res = await relayFetch(`${SERVER}/heartbeat`, {
++      signal: AbortSignal.timeout(HEARTBEAT_REQUEST_TIMEOUT_MS),
++    });
+     if (res.ok) {
+       lastSuccessfulContact = Date.now();
+       // Update activeTarget from relay if provided
+@@ -384,11 +404,20 @@ async function heartbeat() {
+               // health is best-effort and must not erase a verified contract
+               // if its asynchronous response channel closes during a SPA
+               // navigation.
++              if (preferred.autoDiscardable === true) {
++                await chrome.tabs.update(preferred.id, { autoDiscardable: false });
++              }
++              await ensureTabReady(preferred.id);
+               capabilityProbe = await ensureContentScript(preferred.id);
+               health = await sendContentScriptMessageOnce(preferred.id, {
+                 type: "HEALTH_CHECK",
+-              });
++              }, HEARTBEAT_REQUEST_TIMEOUT_MS);
+             } catch (err) {
++              if (!capabilityProbe && !pipelineRunning && Date.now() - lastChatRecoveryAt >= 60_000) {
++                lastChatRecoveryAt = Date.now();
++                console.warn("[sync-zotero] Recovering unresponsive chat tab in the background", err);
++                await reloadTab(preferred.id).catch(() => {});
++              }
+               health = {
+                 ok: false,
+                 contentScriptAlive: capabilityProbe?.pong === true,
+@@ -420,10 +449,11 @@ async function heartbeat() {
+           capabilityProbe,
+           health,
+         });
+-        relayFetch(`${SERVER}/extension_status`, {
++        await relayFetch(`${SERVER}/extension_status`, {
+           method: "POST",
+           headers: { "Content-Type": "application/json" },
+           body: JSON.stringify(extensionStatus),
++          signal: AbortSignal.timeout(HEARTBEAT_REQUEST_TIMEOUT_MS),
+         }).catch(() => {});
+       } catch { /* non-critical */ }
+ 
+@@ -440,7 +470,7 @@ discoverZoteroPort();
+ setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
+ 
+ // --- keepalive: keep the MV3 service worker warm ---------------------------
+-// An idle MV3 background worker is suspended after ~30s, which stops the 10s
++// An idle MV3 background worker is suspended after ~30s, which stops the periodic
+ // heartbeat and lets the Zotero-side freshness window for the extension
+ // status expire ("has not reported a fresh delivery-contract capability").
+ // Chat-tab content scripts ping SW_KEEPALIVE periodically; tab/focus events
+@@ -826,16 +856,18 @@ async function publishReadyConversationState(
+ // ---------------------------------------------------------------------------
+ 
+ // MV3 service workers are killed after ~30s of inactivity.
+-// A Chrome API call every 25s prevents the idle timeout from triggering.
++// A Chrome API call every 10s leaves headroom for delayed background timers.
+ // Also persist state on each keepalive tick to survive SW restarts.
+ setInterval(() => {
+   chrome.storage.session.set({ _keepalive: Date.now() });
+   persistState();
+-}, 25_000);
++}, 10_000);
+ 
+ // Backup: chrome.alarms wakes the service worker up even if it was killed.
+ // The SW module re-executes on restart, so setInterval below auto-resumes.
+-chrome.alarms.create("pollAlarm", { periodInMinutes: 0.5 });
++chrome.alarms.get("pollAlarm").then((alarm) => {
++  if (!alarm) return chrome.alarms.create("pollAlarm", { periodInMinutes: 0.5 });
++}).catch((err) => console.warn("[sync-zotero] Could not schedule the recovery alarm", err));
+ chrome.alarms.onAlarm.addListener((alarm) => {
+   if (alarm.name === "pollAlarm") {
+     heartbeat();
+@@ -1268,10 +1300,12 @@ async function runPipeline(query) {
+       activeChatTabId = tab.id;
+     }
+ 
+-    // ChatGPT defers parts of its client-side text rendering in inactive tabs.
+-    // Select the target tab within its Chrome window before navigation and
+-    // submission so a throttled prefix cannot look terminal to the bridge.
+-    tab = await ensureTabActive(tab.id);
++    // Keep the user's selected browser tab unchanged. The content script
++    // verifies the bound turn and completed transport before accepting a
++    // background ChatGPT response, including a DOM-rendered prefix.
++    if (queryTarget === "chatgpt") {
++      await chrome.tabs.update(tab.id, { autoDiscardable: false });
++    }
+ 
+     const shouldNavigateFresh = startsFresh;
+ 
+@@ -1357,7 +1391,8 @@ async function runPipeline(query) {
+     } = await streamPipeline(tab.id, {
+       pdfBase64:    query.pdf_base64 || null,
+       pdfFilename:  query.pdf_base64 ? (query.pdf_filename || "document.pdf") : null,
+-      prompt:       query.prompt,
++      // PDF text layers can contain NULs that HTML editors discard.
++      prompt:       query.prompt.replace(/\u0000/g, ""),
+       images:       query.images || null,
+       chatgptMode:  query.chatgpt_mode || null,
+       deliveryContractVersion: query.delivery_contract_version,
+@@ -1822,9 +1857,13 @@ function streamPipeline(tabId, payload) {
+ // Idempotent one-shot content-script messaging
+ // ---------------------------------------------------------------------------
+ 
+-function sendContentScriptMessageOnce(tabId, message) {
++function sendContentScriptMessageOnce(tabId, message, timeoutMs) {
+   return new Promise((resolve, reject) => {
++    const timer = timeoutMs === undefined ? null : setTimeout(() => {
++      reject(new Error(`Timed out waiting for ${message.type} from the chat tab.`));
++    }, timeoutMs);
+     chrome.tabs.sendMessage(tabId, message, (response) => {
++      if (timer !== null) clearTimeout(timer);
+       if (chrome.runtime.lastError) {
+         reject(new Error(chrome.runtime.lastError.message));
+       } else {
+@@ -1898,12 +1937,6 @@ async function ensureTabReady(
+   return tab;
+ }
+ 
+-async function ensureTabActive(tabId) {
+-  const tab = await chrome.tabs.get(tabId);
+-  if (!shared.tabNeedsActivation(tab)) return tab;
+-  return chrome.tabs.update(tabId, { active: true });
+-}
+-
+ async function reloadTab(tabId) {
+   await new Promise((resolve, reject) => {
+     chrome.tabs.reload(tabId, () => {
+@@ -1916,17 +1949,29 @@ async function reloadTab(tabId) {
+   });
+ }
+ 
++async function injectChatScripts(injection) {
++  let timer;
++  try {
++    await Promise.race([
++      chrome.scripting.executeScript({ ...injection, injectImmediately: true }),
++      new Promise((_, reject) => {
++        timer = setTimeout(() => reject(new Error("Chat script injection timed out.")),
++          HEARTBEAT_REQUEST_TIMEOUT_MS);
++      }),
++    ]);
++  } finally {
++    clearTimeout(timer);
++  }
++}
++
+ async function ensureContentScript(tabId, requiredDeliveryContractVersion) {
+   const tab = await chrome.tabs.get(tabId);
+   const siteConfig = getSiteConfigByUrl(tab.url);
+   if (!siteConfig) throw new Error("Unsupported WebChat tab URL.");
+   const domCapture = siteConfig.siteId === "gemini";
+   const pingContentScript = () =>
+-    new Promise((resolve) => {
+-      chrome.tabs.sendMessage(tabId, { type: "PING" }, (res) => {
+-        resolve(chrome.runtime.lastError ? null : (res || null));
+-      });
+-    });
++    sendContentScriptMessageOnce(tabId, { type: "PING" }, HEARTBEAT_REQUEST_TIMEOUT_MS)
++      .catch(() => null);
+   const hasRequiredContract = (health) =>
+     (!domCapture || (health?.answerCapture === "dom" && health?.supportedTargets?.includes("gemini"))) && shared.contentScriptMeetsDeliveryContractRequirement(
+       health,
+@@ -1935,23 +1980,16 @@ async function ensureContentScript(tabId, requiredDeliveryContractVersion) {
+   const injectMainWorld = async () => {
+     if (domCapture) return;
+     try {
+-      await chrome.scripting.executeScript({
+-        target: { tabId },
+-        files:  ["injected.js"],
+-        world:  "MAIN",
+-      });
++      await injectChatScripts({ target: { tabId }, files: ["injected.js"], world: "MAIN" });
+     } catch (_) {}
+   };
+ 
+   // Network-backed providers require the MAIN world SSE interceptor.
+   // It has its own __syncZoteroFetchPatched guard to avoid double-patching,
+   // but after full page reloads the guard resets and re-injection is needed.
+-  await injectMainWorld();
+-
+-  // Try pinging the content script
+   let health = await pingContentScript();
+-
+   if (hasRequiredContract(health)) return health;
++  await injectMainWorld();
+   if (health?.pong === true) {
+     // A responsive but incompatible script can otherwise perform the
+     // irreversible click during an extension hot-upgrade race.
+@@ -1965,13 +2003,13 @@ async function ensureContentScript(tabId, requiredDeliveryContractVersion) {
+   // Content script not responsive — inject the shared helpers and listener in
+   // manifest order. This also repairs tabs whose old extension context became
+   // stale after an extension reload.
+-  await chrome.scripting.executeScript({
++  await injectChatScripts({
+     target: { tabId },
+-    files:  ["webchat_shared.js", "gemini_adapter.js", "content_script.js"],
++    files: ["webchat_shared.js", "gemini_adapter.js", "content_script.js"],
+   });
+ 
+   // Poll briefly instead of always paying a fixed 1s delay after injection.
+-  for (let attempt = 0; attempt < 10; attempt++) {
++  for (let attempt = 0; attempt < 3; attempt++) {
+     health = await pingContentScript();
+     if (hasRequiredContract(health)) return health;
+     await new Promise((resolve) => setTimeout(resolve, 100));
+diff --git a/extension/content_script.js b/extension/content_script.js
+index b9f5149..a8725b8 100644
+--- a/extension/content_script.js
++++ b/extension/content_script.js
+@@ -1,3 +1,4 @@
++// Modified for Zotero AI Reading Bridge, November 2026.
+ /**
+  * content_script.js — Runs on supported chat sites (chatgpt.com, chat.deepseek.com).
+  *
+@@ -14,6 +15,12 @@
+  * Site-specific logic is abstracted via SITE_ADAPTER (selected by hostname).
+  */
+ 
++(() => {
++const runtime = chrome.runtime;
++// Manifest injection and recovery can race on the same document. A stale
++// extension context cannot block installation of the replacement listeners.
++if (globalThis.syncZoteroContentIsCurrent?.(runtime)) return;
++
+ // ---------------------------------------------------------------------------
+ // Utility helpers
+ // ---------------------------------------------------------------------------
+@@ -45,6 +52,15 @@ const shared = globalThis.SyncZoteroShared || {
+     matchTimeoutMs: pendingBridgeCommit === true ? 10000 : 300,
+     allowRetry: pendingBridgeCommit !== true,
+   }),
++  selectCompleteAnswerText: (domText, streamText) => {
++    const dom = String(domText || "");
++    const stream = String(streamText || "");
++    if (!dom.trim()) return stream;
++    const normalizedDom = dom.replace(/\s+/g, " ").trim();
++    const normalizedStream = stream.replace(/\s+/g, " ").trim();
++    return normalizedStream.length > normalizedDom.length &&
++      normalizedStream.startsWith(normalizedDom) ? stream : dom;
++  },
+   createTurnCompletionTracker: (nowMs) => {
+     const ts = Number.isFinite(nowMs) ? Number(nowMs) : 0;
+     return {
+@@ -1318,7 +1334,10 @@ function readComposerText(composer) {
+   if (composer.tagName === "TEXTAREA") {
+     return composer.value || "";
+   }
+-  return composer.innerText || composer.textContent || "";
++  // A background editor may expose innerText as raw concatenated text.
++  // Preserve paragraph boundaries directly from its DOM.
++  return shared.readComposerDomText?.(composer) ||
++    composer.innerText || composer.textContent || "";
+ }
+ 
+ function dispatchComposerInput(composer, inputType, data) {
+@@ -1358,7 +1377,7 @@ function setMainWorldChatGPTComposerText(promptText, timeoutMs = 2000) {
+       if (
+         !payload ||
+         payload.source !== "sync-zotero-page" ||
+-        payload.type !== "SYNC_ZOTERO_SET_COMPOSER_TEXT_RESULT_V2" ||
++        payload.type !== "SYNC_ZOTERO_SET_COMPOSER_TEXT_RESULT_V3" ||
+         payload.requestId !== requestId
+       ) {
+         return;
+@@ -1380,7 +1399,7 @@ function setMainWorldChatGPTComposerText(promptText, timeoutMs = 2000) {
+     window.addEventListener("message", onMessage);
+     window.postMessage({
+       source: "sync-zotero-content",
+-      type: "SYNC_ZOTERO_SET_COMPOSER_TEXT_V2",
++      type: "SYNC_ZOTERO_SET_COMPOSER_TEXT_V3",
+       requestId,
+       text: String(promptText || ""),
+     }, "*");
+@@ -2133,7 +2152,16 @@ async function typePromptAndVerify(
+       "Prompt verification failed: ChatGPT displayed the prompt but did not enable Send.",
+     );
+   }
+-  throw new Error("Prompt verification failed: composer text did not match the requested prompt.");
++  const collapse = (text) => shared.normalizeComposerText(text).replace(/\s+/g, " ").trim();
++  const expected = collapse(expectedText);
++  const actual = collapse(readComposerText(findComposerNow()));
++  let mismatchAt = 0;
++  while (mismatchAt < expected.length && expected[mismatchAt] === actual[mismatchAt]) {
++    mismatchAt++;
++  }
++  throw new Error(
++    `Prompt verification failed: composer text did not match the requested prompt (expected ${expected.length} characters, found ${actual.length}, first difference at ${mismatchAt}).`,
++  );
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -3844,9 +3872,7 @@ async function streamResponseSnapshots(
+       assistantTurn?.text ||
+       deepseekAnchoredSnapshot?.answerText ||
+       "";
+-    const answerText = shared.hasMeaningfulAssistantText(domAnswerText)
+-      ? domAnswerText
+-      : (shared.hasMeaningfulAssistantText(sseText) ? sseText : domAnswerText);
++    const answerText = shared.selectCompleteAnswerText(domAnswerText, sseText);
+     const domThinking =
+       assistantTurn?.thinking ||
+       deepseekAnchoredSnapshot?.thinkingText ||
+@@ -3995,7 +4021,10 @@ async function streamResponseSnapshots(
+       lastAssistantTurnKey = assistantTurnKey;
+     }
+ 
+-    if (completion.emitDone && attachmentContractVerified) {
++    const waitingForBackgroundTransport =
++      SITE_ADAPTER?.siteId === "chatgpt" && document.hidden &&
++      !strongTransportCompletion;
++    if (completion.emitDone && attachmentContractVerified && !waitingForBackgroundTransport) {
+       // Re-read the bound assistant turn after a final rebound delay. ChatGPT
+       // can expose a prefix in the DOM long enough to satisfy visual completion
+       // heuristics, especially after a discarded-tab reload.
+@@ -4008,7 +4037,10 @@ async function streamResponseSnapshots(
+         userTurnKey,
+         assistantTurnKey,
+       );
+-      const confirmedAnswerText = confirmedAssistantTurn?.text || "";
++      const confirmedAnswerText = shared.selectCompleteAnswerText(
++        confirmedAssistantTurn?.text || "",
++        strongTransportCompletion ? sseText : "",
++      );
+       const confirmedAssistantTurnKey =
+         confirmedAssistantTurn?.messageKey || assistantTurnKey;
+       const stableTerminalSnapshot =
+@@ -4087,8 +4119,7 @@ async function streamResponseSnapshots(
+       completion.phase !== "verified_done"
+     ) {
+       // Use DOM answer if available, otherwise SSE answer
+-      const finalText = shared.hasMeaningfulAssistantText(lastAnswerText)
+-        ? lastAnswerText : sseText;
++      const finalText = shared.selectCompleteAnswerText(lastAnswerText, sseText);
+       const finalThinking = lastThinkingText || sseThinking || null;
+       recordTurnDebug("sse_fast_completion", {
+         seq,
+@@ -4584,11 +4615,21 @@ function cloneAssistantOutput(node) {
+   const clone = node.cloneNode(true);
+   const originals = Array.from(node.querySelectorAll('img'));
+   const imagePairs = Array.from(clone.querySelectorAll('img'), (img, index) => [img, originals[index]]);
+-  // Image buttons are content, unlike Copy/Download controls. Unwrap only the
+-  // content image, keeping control labels and icons out of the transcript.
++  // Image buttons and inline entity/reference buttons are answer content.
++  // Preserve their children before the later control/status pruning pass.
+   clone.querySelectorAll('button, [role="button"]').forEach((button) => {
+     const images = Array.from(button.querySelectorAll('img:not([aria-hidden="true"])'));
+-    if (images.length) button.replaceWith(...images);
++    if (images.length) {
++      button.replaceWith(...images);
++      return;
++    }
++    const prose = button.closest('[data-markdown-text-style="assistant-message"], .markdown, .prose');
++    const block = button.closest('p, li, h1, h2, h3, h4, h5, h6, td, th, blockquote');
++    const controlLabel = `${button.getAttribute('data-testid') || ''} ${button.getAttribute('aria-label') || ''}`;
++    if (!prose || !block || !clone.contains(block) ||
++        /copy|download|regenerate|retry|read.aloud|share|feedback|复制|下载|重试|朗读|分享/i.test(controlLabel)) return;
++    button.querySelectorAll('svg, [aria-hidden="true"], .sr-only').forEach((icon) => icon.remove());
++    button.replaceWith(...Array.from(button.childNodes));
+   });
+   imagePairs.forEach(([img, original]) => {
+     if (!clone.contains(img)) return;
+@@ -6948,3 +6989,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+   ping();
+ })();
+ // --- end keepalive ---------------------------------------------------------
++
++globalThis.syncZoteroContentIsCurrent = (candidate) =>
++  candidate === runtime && Boolean(runtime.id);
++})();
+diff --git a/extension/injected.js b/extension/injected.js
+index 600c81c..3b3bedc 100644
+--- a/extension/injected.js
++++ b/extension/injected.js
+@@ -1,3 +1,4 @@
++// Modified for Zotero AI Reading Bridge, November 2026.
+ /**
+  * injected.js — Runs in MAIN world (same JS context as the page).
+  *
+@@ -13,7 +14,7 @@
+ (function () {
+   "use strict";
+ 
+-  const COMPOSER_BRIDGE_VERSION = 2;
++  const COMPOSER_BRIDGE_VERSION = 3;
+   const COMPOSER_BRIDGE_SETTLE_TIMEOUT_MS = 750;
+   if (
+     (window.__syncZoteroComposerBridgeVersion || 0) <
+@@ -25,7 +26,7 @@
+       if (
+         !payload ||
+         payload.source !== "sync-zotero-content" ||
+-        payload.type !== "SYNC_ZOTERO_SET_COMPOSER_TEXT_V2" ||
++        payload.type !== "SYNC_ZOTERO_SET_COMPOSER_TEXT_V3" ||
+         typeof payload.requestId !== "string"
+       ) {
+         return;
+@@ -60,7 +61,21 @@
+         selection?.addRange(range);
+ 
+         const clipboardData = new DataTransfer();
+-        clipboardData.setData("text/plain", String(payload.text || ""));
++        const text = String(payload.text || "");
++        if (text.includes("\n") || text.length >= 4000) {
++          // Give the editor literal paragraphs. Its plaintext paste path can
++          // parse Markdown or turn a large paste into a separate attachment.
++          const escapeHtml = (line) => line
++            .replace(/&/g, "&amp;")
++            .replace(/</g, "&lt;")
++            .replace(/>/g, "&gt;");
++          const paragraphs = text.split(/\r?\n/).map((line) =>
++            `<p>${line ? escapeHtml(line) : "<br>"}</p>`,
++          );
++          clipboardData.setData("text/html", paragraphs.join(""));
++        } else {
++          clipboardData.setData("text/plain", text);
++        }
+         const pasteEvent = new ClipboardEvent("paste", {
+           bubbles: true,
+           cancelable: true,
+@@ -102,7 +117,7 @@
+ 
+       window.postMessage({
+         source: "sync-zotero-page",
+-        type: "SYNC_ZOTERO_SET_COMPOSER_TEXT_RESULT_V2",
++        type: "SYNC_ZOTERO_SET_COMPOSER_TEXT_RESULT_V3",
+         requestId: payload.requestId,
+         ok,
+         pasteAccepted,
+diff --git a/extension/manifest.json b/extension/manifest.json
+index ee50cfc..8ac7d87 100644
+--- a/extension/manifest.json
++++ b/extension/manifest.json
+@@ -1,7 +1,7 @@
+ {
+   "manifest_version": 3,
+   "name": "Sync for Zotero",
+-  "version": "0.0.19",
++  "version": "0.0.19.8",
+   "description": "Bridge LLM for Zotero with ChatGPT, DeepSeek and Google Gemini web chats",
+   "minimum_chrome_version": "119",
+   "permissions": [
+diff --git a/extension/webchat_shared.js b/extension/webchat_shared.js
+index c5a06b0..73bfdc5 100644
+--- a/extension/webchat_shared.js
++++ b/extension/webchat_shared.js
+@@ -1,3 +1,4 @@
++// Modified for Zotero AI Reading Bridge, November 2026.
+ (function (root, factory) {
+   const api = factory();
+   root.SyncZoteroShared = api;
+@@ -17,6 +18,23 @@
+       .trim();
+   }
+ 
++  function readComposerDomText(composer) {
++    if (!composer) return "";
++    if (composer.tagName === "TEXTAREA") return composer.value || "";
++    const readNode = (node) => {
++      if (node.nodeType === 3) return node.nodeValue || "";
++      if (node.nodeType !== 1) return "";
++      if (node.tagName === "BR") return "\n";
++      const text = Array.from(node.childNodes || [], readNode).join("");
++      return /^(P|DIV|LI|BLOCKQUOTE|PRE|H[1-6])$/.test(node.tagName)
++        ? `\n${text}\n`
++        : text;
++    };
++    return composer.childNodes?.length
++      ? Array.from(composer.childNodes, readNode).join("")
++      : composer.textContent || "";
++  }
++
+   function composerTextMatchesPrompt(promptText, composerText) {
+     const a = normalizeComposerText(promptText);
+     const b = normalizeComposerText(composerText);
+@@ -1091,6 +1109,22 @@
+     };
+   }
+ 
++  // An inactive ChatGPT tab can expose only the first part of the answer in
++  // its DOM after the response stream has already supplied the whole text.
++  // Prefer transport text only when it extends that same answer, never when
++  // the two sources disagree (which could indicate a different turn).
++  function selectCompleteAnswerText(domText, streamText) {
++    const dom = String(domText || "");
++    const stream = String(streamText || "");
++    if (!hasMeaningfulAssistantText(dom)) return stream;
++    const normalizedDom = normalizeComposerText(dom).replace(/\s+/g, " ");
++    const normalizedStream = normalizeComposerText(stream).replace(/\s+/g, " ");
++    return normalizedStream.length > normalizedDom.length &&
++      normalizedStream.startsWith(normalizedDom)
++      ? stream
++      : dom;
++  }
++
+   function terminalAnswerSnapshotIsStable(candidate, latest) {
+     const candidateText = normalizeComposerText(candidate?.text || "");
+     const latestText = normalizeComposerText(latest?.text || "");
+@@ -1558,6 +1592,7 @@
+     canUseDeepSeekQuiescentCompletion,
+     completionTimingForSignals,
+     composerTextMatchesPrompt,
++    readComposerDomText,
+     composerBridgeAllowsSynchronousFallback,
+     composerBridgeWriteTransition,
+     composerPromptVerificationPolicy,
+@@ -1590,6 +1625,7 @@
+     tabNeedsActivation,
+     tabNeedsLifecycleReload,
+     terminalAnswerSnapshotIsStable,
++    selectCompleteAnswerText,
+     waitForNewExpectedAttachmentEvidence,
+     confirmAttachmentAcceptedThenReady,
+   };
+diff --git a/test/chatgpt_composer_bridge_contract.test.mjs b/test/chatgpt_composer_bridge_contract.test.mjs
+index 00a9744..b6634ee 100644
+--- a/test/chatgpt_composer_bridge_contract.test.mjs
++++ b/test/chatgpt_composer_bridge_contract.test.mjs
+@@ -1,3 +1,4 @@
++// Modified for Zotero AI Reading Bridge, November 2026.
+ import assert from "node:assert/strict";
+ import { createRequire } from "node:module";
+ import fs from "node:fs";
+@@ -18,8 +19,8 @@ const contentScriptSource = fs.readFileSync(
+   "utf8",
+ );
+ 
+-const setComposerRequestType = "SYNC_ZOTERO_SET_COMPOSER_TEXT_V2";
+-const setComposerResultType = "SYNC_ZOTERO_SET_COMPOSER_TEXT_RESULT_V2";
++const setComposerRequestType = "SYNC_ZOTERO_SET_COMPOSER_TEXT_V3";
++const setComposerResultType = "SYNC_ZOTERO_SET_COMPOSER_TEXT_RESULT_V3";
+ 
+ function createBridgeHarness({
+   bridgeSettleTimeoutMs = null,
+@@ -32,6 +33,7 @@ function createBridgeHarness({
+   const postedMessages = [];
+   let sendEnabled = false;
+   let pasteDispatchCount = 0;
++  let lastClipboard;
+ 
+   class FakeHTMLElement {
+     innerText = "";
+@@ -44,8 +46,17 @@ function createBridgeHarness({
+     dispatchEvent(event) {
+       if (event.type !== "paste") return true;
+       pasteDispatchCount += 1;
++      lastClipboard = event.clipboardData;
+       const nextText = pasteTransform(
+-        event.clipboardData.getData("text/plain"),
++        event.clipboardData.getData("text/html")
++          ? event.clipboardData.getData("text/html")
++            .replace(/<br>/g, "")
++            .replace(/<\/p><p>/g, "\n")
++            .replace(/^<p>|<\/p>$/g, "")
++            .replace(/&lt;/g, "<")
++            .replace(/&gt;/g, ">")
++            .replace(/&amp;/g, "&")
++          : event.clipboardData.getData("text/plain"),
+       );
+       event.defaultPrevented = true;
+       const applyPaste = () => {
+@@ -149,6 +160,7 @@ function createBridgeHarness({
+ 
+   return {
+     composer,
++    get lastClipboard() { return lastClipboard; },
+     get sendEnabled() {
+       return sendEnabled;
+     },
+@@ -378,3 +390,28 @@ test("main-world bridge supports the modern composer without prompt-textarea", a
+   assert.equal(harness.composer.innerText, "Modern composer request");
+   assert.equal(harness.postedMessages.at(-1).ok, true);
+ });
++
++
++test("reading context uses literal escaped paragraphs without triggering plaintext paste conversion", async () => {
++  const harness = createBridgeHarness();
++  const text = "[Reading context]\n\n> Selected text with < and &\n" + "Long page text. ".repeat(1000);
++  await dispatchComposerRequest(harness, "reading", text);
++  assert.equal(harness.lastClipboard.getData("text/plain"), "");
++  assert.match(harness.lastClipboard.getData("text/html"), /&gt; Selected text with &lt; and &amp;/);
++  assert.equal(harness.composer.innerText, text);
++  assert.equal(harness.pasteDispatchCount, 1);
++});
++
++test("background editor text retains paragraph and hard-break boundaries", () => {
++  const text = (nodeValue) => ({ nodeType: 3, nodeValue });
++  const node = (tagName, ...childNodes) => ({ nodeType: 1, tagName, childNodes });
++  const editor = node("DIV",
++    node("P", text("Selected passage: econ-"), node("BR"), text("omic roles")),
++    node("P", text("User question: "), node("STRONG", text("这句话什么意思"))),
++  );
++  editor.innerText = "Selected passage: econ-omic rolesUser question: 这句话什么意思";
++  assert.equal(shared.composerTextMatchesPrompt(
++    "Selected passage: econ-\nomic roles\n\nUser question: 这句话什么意思",
++    shared.readComposerDomText(editor),
++  ), true);
++});
+diff --git a/test/chatgpt_dom_adapter.test.mjs b/test/chatgpt_dom_adapter.test.mjs
+index 806b808..69a7c9c 100644
+--- a/test/chatgpt_dom_adapter.test.mjs
++++ b/test/chatgpt_dom_adapter.test.mjs
+@@ -1,3 +1,5 @@
++// Modified for Zotero AI Reading Bridge, November 2026.
++import { unwrapContentSource } from "./helpers/content_source.mjs";
+ import assert from "node:assert/strict";
+ import fs from "node:fs";
+ import vm from "node:vm";
+@@ -34,7 +36,7 @@ function content(html = "", url = homeUrl) {
+     chrome: { runtime: { onMessage: { addListener() {} },
+       onConnect: { addListener() {} }, sendMessage() {} } },
+   });
+-  vm.runInContext(contentSource, context);
++  vm.runInContext(unwrapContentSource(contentSource), context);
+   const api = vm.runInContext(`({ adapter: SITE_ADAPTER, extractConversationTranscript,
+     findStopButton, resolveBoundAssistantTurn, findMatchingUserTurn, hasResponseActionBar,
+     streamResponseSnapshots, buildDiagnostic, ensureChatGPTChatMode })`, context);
+@@ -518,3 +520,37 @@ test('DeepSeek rich output completes with its transcript-derived turn key', asyn
+   assert.equal(terminal?.runState, 'done');
+   assert.equal(terminal?.text, '```svg\n<svg><circle/></svg>\n```');
+ });
++
++test("inactive ChatGPT waits for transport and returns the complete answer behind a rendered prefix", async () => {
++  const page = content(composer, homeUrl);
++  Object.defineProperty(page.document, "hidden", { value: true });
++  const baseline = page.extractConversationTranscript();
++  const prefix = "The selected text argues";
++  assert.ok(fixture.includes(answer));
++  const clock = installClock(page, [
++    { at: 1000, run: () => {
++      page.window.location = new URL(realChatUrl);
++      page.document.body.innerHTML = fixture.replace(answer, prefix);
++    } },
++    { at: 20000, run: () => transport(page, {
++      type: "SYNC_ZOTERO_SSE", text: answer, done: true, activeStreamCount: 0,
++    }) },
++  ]);
++  const { events, port } = recorder(clock);
++  await page.streamResponseSnapshots(port, 23, 1, baseline, prompt, "|0", { clickAttempts: 1 }, 60000);
++  const terminal = events.find((event) => event.type === "terminal");
++  assert.equal(terminal?.runState, "done");
++  assert.equal(terminal?.text, answer);
++  assert.ok(terminal.at >= 20000, "a quiet rendered prefix alone must not finish the background turn");
++});
++
++test("inline entity buttons retain bold paper names while response toolbar controls are excluded", () => {
++  const page = content(`<div data-message-author-role="assistant" data-message-id="paper-answer">
++    <div class="markdown"><p>论文：<span role="button"><strong>The Rise and Future Demise of the World Capitalist System</strong><svg aria-label="Open entity"></svg></span></p>
++    <p>作者：<button><strong>Immanuel Wallerstein</strong></button>（伊曼纽尔·沃勒斯坦）</p>
++    <p>正文<button aria-label="Copy answer">Copy</button></p></div>
++    <div><button aria-label="Read aloud">Read aloud</button><button data-testid="copy-turn-action-button">Copy answer</button></div>
++  </div>`.replace(/\n\s+/g, ""), realChatUrl);
++  const message = page.extractConversationTranscript().messages[0];
++  assert.equal(message.text, "论文：**The Rise and Future Demise of the World Capitalist System**\n\n作者：**Immanuel Wallerstein**（伊曼纽尔·沃勒斯坦）\n\n正文");
++});
+diff --git a/test/gemini_adapter.test.mjs b/test/gemini_adapter.test.mjs
+index a10909a..4d24d81 100644
+--- a/test/gemini_adapter.test.mjs
++++ b/test/gemini_adapter.test.mjs
+@@ -1,3 +1,5 @@
++// Modified for Zotero AI Reading Bridge, November 2026.
++import { unwrapContentSource } from "./helpers/content_source.mjs";
+ import assert from "node:assert/strict";
+ import fs from "node:fs";
+ import vm from "node:vm";
+@@ -33,7 +35,7 @@ function content(html = "", url = chatUrl) {
+   });
+   const adapterPath = new URL("../extension/gemini_adapter.js", import.meta.url);
+   if (fs.existsSync(adapterPath)) vm.runInContext(fs.readFileSync(adapterPath, "utf8"), context);
+-  vm.runInContext(contentSource, context);
++  vm.runInContext(unwrapContentSource(contentSource), context);
+   const api = vm.runInContext(`({ adapter: SITE_ADAPTER, extractConversationTranscript,
+     prepareRichOutput: typeof prepareRichOutput === "function" ? prepareRichOutput : null,
+     extractFullConversationTranscript, findStopButton, collectHealthStatus, collectHistoryEntries, scrapeHistory,
+@@ -422,8 +424,17 @@ test("manifest loads a working Gemini adapter without loading a network intercep
+   const globals = { ...page.context };
+   delete globals.SyncZoteroGemini;
+   const runtime = vm.createContext(globals);
+-  for (const script of scripts.flatMap((entry) => entry.js)) vm.runInContext(read(`../extension/${script}`), runtime);
+-  assert.equal(vm.runInContext("SITE_ADAPTER.siteId", runtime), "gemini");
++  runtime.chrome.runtime.id = "test-extension";
++  const scriptsToLoad = scripts.flatMap((entry) => entry.js);
++  for (const script of scriptsToLoad) vm.runInContext(read(`../extension/${script}`), runtime);
++  const installed = runtime.syncZoteroContentIsCurrent;
++  const ping = { type: "PING" };
++  const replies = [];
++  vm.runInContext(contentSource, runtime);
++  assert.equal(runtime.syncZoteroContentIsCurrent, installed);
++  for (const listener of page.listeners.slice(-3)) listener(ping, {}, (reply) => replies.push(reply));
++  assert.equal(replies.length, 1);
++  assert.equal(replies[0].answerCapture, "dom");
+ });
+ 
+ test("manual injection loads Gemini DOM support without injecting the MAIN-world network hook", async () => {
+@@ -437,9 +448,17 @@ test("manual injection loads Gemini DOM support without injecting the MAIN-world
+   });
+   const configStart = backgroundSource.indexOf("const SITE_CONFIGS =");
+   const configEnd = backgroundSource.indexOf("let activeTarget =", configStart);
+-  const start = backgroundSource.indexOf("async function ensureContentScript(");
+-  const end = backgroundSource.indexOf("\n}", start) + 2;
+-  vm.runInContext(backgroundSource.slice(configStart, configEnd) + backgroundSource.slice(start, end), context);
++  const start = backgroundSource.indexOf("async function injectChatScripts(");
++  const end = backgroundSource.indexOf("\n}", backgroundSource.indexOf("async function ensureContentScript(", start)) + 2;
++  const messageStart = backgroundSource.indexOf("function sendContentScriptMessageOnce(");
++  const messageEnd = backgroundSource.indexOf("\n}", messageStart) + 2;
++  vm.runInContext(
++    "const HEARTBEAT_REQUEST_TIMEOUT_MS = 4000;" +
++      backgroundSource.slice(configStart, configEnd) +
++      backgroundSource.slice(messageStart, messageEnd) +
++      backgroundSource.slice(start, end),
++    context,
++  );
+   const health = await context.ensureContentScript(1, 1);
+   assert.equal(health.answerCapture, "dom");
+   assert.ok(injected.every((args) => args.world !== "MAIN"));
+diff --git a/test/helpers/conversation_workflow.mjs b/test/helpers/conversation_workflow.mjs
+index 4958221..5f81f54 100644
+--- a/test/helpers/conversation_workflow.mjs
++++ b/test/helpers/conversation_workflow.mjs
+@@ -1,3 +1,5 @@
++// Modified for Zotero AI Reading Bridge, November 2026.
++import { unwrapContentSource } from "./content_source.mjs";
+ import assert from "node:assert/strict";
+ import fs from "node:fs";
+ import vm from "node:vm";
+@@ -20,7 +22,7 @@ const markup = {
+ 
+ // Exercise the worker, actual DOM readiness, and pre-submit guard together.
+ // Only browser navigation, relay I/O, and the send itself are mocked.
+-export function conversationFollowup({ target, expectedUrl, initialUrl, redirectUrl = initialUrl, beforeSend }) {
++export function conversationFollowup({ target, expectedUrl, initialUrl, redirectUrl = initialUrl, beforeSend, active = true }) {
+   const { window, document } = parseHTML(`<html><body>${markup[target]}</body></html>`);
+   window.location = new URL(initialUrl);
+   window.getComputedStyle = () => ({ display: "block", visibility: "visible" });
+@@ -35,12 +37,12 @@ export function conversationFollowup({ target, expectedUrl, initialUrl, redirect
+     setInterval: () => 1, clearInterval() {}, setTimeout, clearTimeout,
+     chrome: { runtime: { onMessage: { addListener() {} }, onConnect: { addListener() {} }, sendMessage() {} } },
+   });
+-  vm.runInContext(geminiSource + contentSource + "\nworkerSleep = advanceTimer;", pageContext);
++  vm.runInContext(geminiSource + unwrapContentSource(contentSource) + "\nworkerSleep = advanceTimer;", pageContext);
+   const page = { window, ...vm.runInContext(
+     "({ adapter: SITE_ADAPTER, waitForChatReady, assertSubmissionConversation, extractConversationTranscript })", pageContext,
+   ) };
+-  const errors = [], sent = [], navigations = [], reports = [];
+-  const tab = () => ({ id: 1, active: true, url: window.location.href });
++  const errors = [], sent = [], navigations = [], reports = [], tabUpdates = [];
++  const tab = () => ({ id: 1, active, url: window.location.href });
+   const context = vm.createContext({
+     shared, URL, console, pipelineRunning: false, activePipelineSeq: 0, activePipelineAttempt: 0,
+     activeTarget: target, activeChatTabId: 1, SUPPORTED_DELIVERY_CONTRACTS: [1], MAX_PRE_SUBMIT_RELEASES: 3,
+@@ -60,9 +62,13 @@ export function conversationFollowup({ target, expectedUrl, initialUrl, redirect
+       const transcript = page.extractConversationTranscript();
+       return { text: "Verified answer", runState: "done", remoteChatUrl: transcript.chatUrl, remoteChatId: transcript.chatId };
+     },
+-    chrome: { tabs: { get: async () => tab(), update: async (_id, { url }) => {
+-      navigations.push(url);
+-      window.location = new URL(redirectUrl);
++    chrome: { tabs: { get: async () => tab(), update: async (_id, update) => {
++      tabUpdates.push(update);
++      if (update.url) {
++        navigations.push(update.url);
++        window.location = new URL(redirectUrl);
++      }
++      if (typeof update.active === "boolean") active = update.active;
+       return tab();
+     } } },
+   });
+@@ -74,7 +80,7 @@ export function conversationFollowup({ target, expectedUrl, initialUrl, redirect
+   const pipelineEnd = backgroundSource.indexOf("async function submitError(", pipelineStart);
+   vm.runInContext(backgroundSource.slice(configStart, configEnd) +
+     backgroundSource.slice(readyStart, readyEnd) + backgroundSource.slice(pipelineStart, pipelineEnd), context);
+-  return { page, errors, sent, navigations, reports, run: (query = {}) => context.runPipeline({
++  return { page, errors, sent, navigations, reports, tabUpdates, run: (query = {}) => context.runPipeline({
+     seq: 13, attempt: 1, target, delivery_contract_version: 1, prompt: "Follow up",
+     expected_chat_url: expectedUrl, expected_chat_id: new URL(expectedUrl).pathname.replace(/\/$/, "").split("/").pop(), ...query,
+   }) };
+diff --git a/test/background_reading.test.mjs b/test/background_reading.test.mjs
+new file mode 100644
+index 0000000..987cd51
+--- /dev/null
++++ b/test/background_reading.test.mjs
+@@ -0,0 +1,79 @@
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import { createRequire } from "node:module";
++import test from "node:test";
++import vm from "node:vm";
++import { conversationFollowup } from "./helpers/conversation_workflow.mjs";
++
++const require = createRequire(import.meta.url);
++const shared = require("../extension/webchat_shared.js");
++
++test("a follow-up can submit from an inactive ChatGPT tab without selecting it", async () => {
++  const url = "https://chatgpt.com/c/11111111-2222-4333-8444-555555555555";
++  const h = conversationFollowup({ target: "chatgpt", expectedUrl: url, initialUrl: url, active: false });
++  await h.run({ prompt: "Selected passage: text\u0000 from the PDF\u0000." });
++  assert.deepEqual(h.errors, []);
++  assert.equal(h.sent[0]?.prompt, "Selected passage: text from the PDF.");
++  assert.equal(h.sent.length, 1);
++  assert.equal(h.tabUpdates.some((update) => update.active === true), false);
++  assert.equal(h.tabUpdates.some((update) => update.autoDiscardable === false), true);
++});
++
++test("background-rendered prefix uses the complete matching transport answer", () => {
++  assert.equal(shared.selectCompleteAnswerText("The paper argues", "The paper argues that institutions matter."), "The paper argues that institutions matter.");
++  assert.equal(shared.selectCompleteAnswerText("The paper\nargues", "The paper argues that institutions matter."), "The paper argues that institutions matter.");
++  assert.equal(shared.selectCompleteAnswerText("A different answer", "The paper argues that institutions matter."), "A different answer");
++  assert.equal(shared.selectCompleteAnswerText("The complete DOM answer", "The complete"), "The complete DOM answer");
++  assert.equal(shared.selectCompleteAnswerText("", "The complete stream answer"), "The complete stream answer");
++});
++
++test("concurrent heartbeat kicks share one probe and recover after a failure", async () => {
++  const source = fs.readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
++  const start = source.indexOf("let heartbeatInFlight = null;");
++  const end = source.indexOf("// Heartbeat: checks connectivity", start);
++  let count = 0;
++  let rejectProbe;
++  const context = vm.createContext({ checkHeartbeat: () => {
++    count++;
++    return new Promise((_resolve, reject) => { rejectProbe = reject; });
++  } });
++  vm.runInContext(source.slice(start, end), context);
++  const first = context.heartbeat();
++  assert.equal(context.heartbeat(), first);
++  assert.equal(count, 1);
++  rejectProbe(new Error("probe unavailable"));
++  await assert.rejects(first, /probe unavailable/);
++  const next = context.heartbeat();
++  assert.notEqual(next, first);
++  assert.equal(count, 2);
++  rejectProbe(new Error("probe unavailable"));
++  await assert.rejects(next, /probe unavailable/);
++});
++
++test("port rediscovery completes when initiated by an in-flight heartbeat", async () => {
++  const source = fs.readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
++  const start = source.indexOf("let _portDiscoveryInFlight = false;");
++  const end = source.indexOf("// Discover port on startup", start);
++  let requests = 0;
++  const context = vm.createContext({
++    SERVER: "http://localhost:23119/llm-for-zotero/webchat",
++    RELAY_HOSTS: ["127.0.0.1"],
++    HEARTBEAT_REQUEST_TIMEOUT_MS: 4000,
++    zoteroConnected: true,
++    console: { log() {} },
++    AbortSignal,
++    relayFetch: async (url) => {
++      requests++;
++      if (url.endsWith("/debug")) return { ok: true, json: async () => ({ status: "idle" }) };
++      return { ok: false };
++    },
++  });
++  const discovery = source.slice(start, end).replace(
++    /function resetExtensionState\(\) \{[\s\S]*?\n\}/,
++    "function resetExtensionState() {}",
++  );
++  vm.runInContext(discovery, context);
++  await context.heartbeat();
++  assert.equal(context.SERVER, "http://127.0.0.1:23119/llm-for-zotero/webchat");
++  assert.equal(requests, 2);
++});
+diff --git a/test/helpers/content_source.mjs b/test/helpers/content_source.mjs
+new file mode 100644
+index 0000000..8522d7b
+--- /dev/null
++++ b/test/helpers/content_source.mjs
+@@ -0,0 +1,6 @@
++// White-box fixtures access content-script internals in their VM context.
++export function unwrapContentSource(source) {
++  const body = source.indexOf("// Utility helpers");
++  const end = source.lastIndexOf("globalThis.syncZoteroContentIsCurrent =");
++  return source.slice(body, end);
++}

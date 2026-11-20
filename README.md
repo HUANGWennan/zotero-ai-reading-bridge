@@ -1,5 +1,7 @@
 # Zotero AI Reading Bridge
 
+**最新版 [v0.2.0](../../releases/tag/v0.2.0)** 支持 HTML 网页快照。首次提问会发送正文，每次提问都会附上当前可见区域的截图。请从发布页下载最新版 Zotero 插件和浏览器扩展。
+
 在 Zotero 里读 PDF 时，点击阅读器的 **AI** 按钮即可把问题发给浏览器中的 ChatGPT。插件会附上当前页图像，并在可提取时补上页内文字和选中的段落。每篇 PDF 首次绑定到一个会话时会上传全文。同一会话中继续阅读同一份 PDF 时，通常只需发送当前页和问题。切换论文或主动开启新会话时，会重新发送 PDF。
 
 这是 [LLM for Zotero](https://github.com/yilewang/llm-for-zotero) 和 [Sync for Zotero](https://github.com/yilewang/sync-for-zotero) 的非官方定制组合。需要同时安装 Zotero 插件和浏览器扩展。

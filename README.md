@@ -1,6 +1,6 @@
 # Zotero AI Reading Bridge
 
-**最新版 [v0.2.0](../../releases/tag/v0.2.0)** 支持 HTML 网页快照。首次提问会发送正文，每次提问都会附上当前可见区域的截图。请从发布页下载最新版 Zotero 插件和浏览器扩展。
+**最新版 [v0.2.1](../../releases/tag/v0.2.1)** 将 ChatGPT 回复里的 SVG 图表卡片转为 PNG，按正文原顺序显示在 Zotero 侧栏。支持 HTML 快照阅读。
 
 在 Zotero 里读 PDF 时，点击阅读器的 **AI** 按钮即可把问题发给浏览器中的 ChatGPT。插件会附上当前页图像，并在可提取时补上页内文字和选中的段落。每篇 PDF 首次绑定到一个会话时会上传全文。同一会话中继续阅读同一份 PDF 时，通常只需发送当前页和问题。切换论文或主动开启新会话时，会重新发送 PDF。
 
@@ -8,8 +8,8 @@
 
 ## 安装
 
-1. 下载 [Zotero 插件](LLM-for-Zotero-3.9.16.20261108.xpi)。在 Zotero 打开 **工具 → 插件**，从齿轮菜单选择从文件安装并选中 XPI。它与原版使用同一个插件标识，安装会替换原版。安装后可以将这个插件的自动更新设为关闭，防止上游更新覆盖本项目的改动。
-2. 下载并解压 [浏览器扩展](Sync-for-Zotero-0.0.19.8.zip)。在 Edge 打开 `edge://extensions`，或在 Chrome 打开 `chrome://extensions`，启用开发人员模式，选择 **加载解压缩的扩展**，再选中解压后的 `extension` 文件夹。若已有旧版 Sync for Zotero，先停用旧版，避免两个扩展同时处理同一条请求。
+1. 下载 [Zotero 插件](../../releases/download/v0.2.0/LLM-for-Zotero-3.9.16.20261120.2.xpi)。在 Zotero 打开 **工具 → 插件**，从齿轮菜单选择从文件安装并选中 XPI。它与原版使用同一个插件标识，安装会替换原版。安装后可以将这个插件的自动更新设为关闭，防止上游更新覆盖本项目的改动。
+2. 下载并解压 [浏览器扩展 0.0.19.14](Sync-for-Zotero-0.0.19.14.zip)。在 Edge 打开 `edge://extensions`，或在 Chrome 打开 `chrome://extensions`，启用开发人员模式，选择 **加载解压缩的扩展**，再选中解压后的 `extension` 文件夹。若已有旧版 Sync for Zotero，先停用旧版，避免两个扩展同时处理同一条请求。
 3. 在浏览器登录 ChatGPT。进入 LLM for Zotero 设置，选择 **WebChat** 模式和 ChatGPT。打开 Zotero 里的 PDF，在阅读器点击 **AI**，等侧栏显示 **Ready** 后发送问题。
 4. 在同一会话翻页继续追问。需要对另一篇论文提问时，先切换到对应的 Zotero PDF 标签页。
 
@@ -30,9 +30,9 @@ git -C sync-for-zotero apply "$root/sync-for-zotero.patch"
 (cd sync-for-zotero && npm ci && npm test)
 ```
 
-Zotero 的构建产物在 `llm-for-zotero/.scaffold/build/llm-for-zotero.xpi`。浏览器可以直接加载 `sync-for-zotero/extension/`。下载文件的校验值见 [SHA256SUMS](SHA256SUMS)。
+Zotero 的构建产物在 `llm-for-zotero/.scaffold/build/llm-for-zotero.xpi`。浏览器可以直接加载 `sync-for-zotero/extension/`。本次扩展与补丁的校验值见 [SHA256SUMS-v0.2.1](SHA256SUMS-v0.2.1)。
 
-本版通过了 Zotero 阅读上下文的 10 项测试和浏览器扩展的 298 项测试。阅读流程曾在真实 ChatGPT 会话中验证。机器休眠后的自动恢复以及其他浏览器、网页服务的同等体验仍需验证。网页界面更新可能影响桥接。
+本版通过了 Zotero 阅读上下文的 10 项测试和浏览器扩展的 300 项测试（含图表卡片到 PNG 的回归测试）。阅读流程曾在真实 ChatGPT 会话中验证。机器休眠后的自动恢复以及其他浏览器、网页服务的同等体验仍需验证。网页界面更新可能影响桥接。
 
 ## 上游与许可证
 

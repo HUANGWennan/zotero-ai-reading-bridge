@@ -266,15 +266,10 @@ index fc70e02..60246ef 100644
      if (hasRequiredContract(health)) return health;
      await new Promise((resolve) => setTimeout(resolve, 100));
 diff --git a/extension/content_script.js b/extension/content_script.js
-index b9f5149..a8725b8 100644
+index b9f5149..1e087ef 100644
 --- a/extension/content_script.js
 +++ b/extension/content_script.js
-@@ -1,3 +1,4 @@
-+// Modified for Zotero AI Reading Bridge, November 2026.
- /**
-  * content_script.js — Runs on supported chat sites (chatgpt.com, chat.deepseek.com).
-  *
-@@ -14,6 +15,12 @@
+@@ -14,6 +14,12 @@
   * Site-specific logic is abstracted via SITE_ADAPTER (selected by hostname).
   */
  
@@ -287,7 +282,7 @@ index b9f5149..a8725b8 100644
  // ---------------------------------------------------------------------------
  // Utility helpers
  // ---------------------------------------------------------------------------
-@@ -45,6 +52,15 @@ const shared = globalThis.SyncZoteroShared || {
+@@ -45,6 +51,15 @@ const shared = globalThis.SyncZoteroShared || {
      matchTimeoutMs: pendingBridgeCommit === true ? 10000 : 300,
      allowRetry: pendingBridgeCommit !== true,
    }),
@@ -303,7 +298,7 @@ index b9f5149..a8725b8 100644
    createTurnCompletionTracker: (nowMs) => {
      const ts = Number.isFinite(nowMs) ? Number(nowMs) : 0;
      return {
-@@ -1318,7 +1334,10 @@ function readComposerText(composer) {
+@@ -1318,7 +1333,10 @@ function readComposerText(composer) {
    if (composer.tagName === "TEXTAREA") {
      return composer.value || "";
    }
@@ -315,7 +310,7 @@ index b9f5149..a8725b8 100644
  }
  
  function dispatchComposerInput(composer, inputType, data) {
-@@ -1358,7 +1377,7 @@ function setMainWorldChatGPTComposerText(promptText, timeoutMs = 2000) {
+@@ -1358,7 +1376,7 @@ function setMainWorldChatGPTComposerText(promptText, timeoutMs = 2000) {
        if (
          !payload ||
          payload.source !== "sync-zotero-page" ||
@@ -324,7 +319,7 @@ index b9f5149..a8725b8 100644
          payload.requestId !== requestId
        ) {
          return;
-@@ -1380,7 +1399,7 @@ function setMainWorldChatGPTComposerText(promptText, timeoutMs = 2000) {
+@@ -1380,7 +1398,7 @@ function setMainWorldChatGPTComposerText(promptText, timeoutMs = 2000) {
      window.addEventListener("message", onMessage);
      window.postMessage({
        source: "sync-zotero-content",
@@ -333,7 +328,95 @@ index b9f5149..a8725b8 100644
        requestId,
        text: String(promptText || ""),
      }, "*");
-@@ -2133,7 +2152,16 @@ async function typePromptAndVerify(
+@@ -1498,6 +1516,44 @@ async function waitForComposerPromptMatch(
+ // Step 1a: Attach images (screenshots) to ChatGPT
+ // ---------------------------------------------------------------------------
+ 
++function getChatGPTComposerImagePreviews() {
++  let region = findComposerNow()?.parentElement;
++  const previews = new Set();
++  for (let depth = 0; region && depth < 8; depth++, region = region.parentElement) {
++    if (region.matches("main, [role='main']") ||
++        region.querySelector(SITE_ADAPTER.conversationMessageSelector)) break;
++    for (const image of region.querySelectorAll("img[src]")) {
++      if (isVisibleElement(image)) previews.add(image);
++    }
++  }
++  return previews;
++}
++
++async function attachChatGPTImage(file) {
++  const baseline = getChatGPTComposerImagePreviews();
++  if (!applyFilesToComposerFileInput([file], [
++    'input[type="file"][accept*="image"]',
++    'input[type="file"]:not([accept])',
++    'input[type="file"][accept=""]',
++  ])) {
++    const composer = await getComposerElement();
++    composer.focus();
++    const clipboardData = new DataTransfer();
++    clipboardData.items.add(file);
++    composer.dispatchEvent(new ClipboardEvent("paste", {
++      clipboardData, bubbles: true, cancelable: true, composed: true,
++    }));
++  }
++
++  const deadline = Date.now() + PDF_ATTACHMENT_ACCEPT_TIMEOUT_MS;
++  while (Date.now() < deadline) {
++    const previews = getChatGPTComposerImagePreviews();
++    if (previews.size > baseline.size) return;
++    await sleep(PDF_ATTACHMENT_POLL_INTERVAL_MS);
++  }
++  throw new Error("ChatGPT did not confirm the screenshot attachment in the composer.");
++}
++
+ async function attachImages(imageDataUrls) {
+   if (!imageDataUrls || !imageDataUrls.length) return;
+ 
+@@ -1513,6 +1569,10 @@ async function attachImages(imageDataUrls) {
+     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+     const file = new File([bytes], `screenshot.${ext}`, { type: mime });
+ 
++    if (SITE_ADAPTER?.siteId === "chatgpt") {
++      await attachChatGPTImage(file);
++      continue;
++    }
+     if (SITE_ADAPTER?.uploadFile) {
+       await SITE_ADAPTER.uploadFile(file);
+       continue;
+@@ -1810,9 +1870,7 @@ async function waitForPdfAttachmentConfirmation({
+   });
+ }
+ 
+-// Some sites (current DeepSeek builds) ignore synthetic drag/drop events but
+-// still wire the native file input behind their "+" button. Attach through
+-// that input first when the adapter advertises one.
++// Attach through the native input when the site's adapter can identify it.
+ function applyFilesToComposerFileInput(files, selectors) {
+   const list = Array.isArray(selectors) ? selectors : [];
+   for (const selector of list) {
+@@ -1825,12 +1883,15 @@ function applyFilesToComposerFileInput(files, selectors) {
+     if (!input || input.tagName !== "INPUT" || input.type !== "file") continue;
+     if (input.disabled) continue;
+     const accept = String(input.accept || "").toLowerCase();
+-    const acceptsPdf =
++    const acceptsFiles = files.every((file) =>
+       !accept ||
+-      accept.includes(".pdf") ||
+-      accept.includes("pdf") ||
+-      accept.includes("*");
+-    if (!acceptsPdf) continue;
++      accept.includes("*") ||
++      accept.includes(file.type) ||
++      (file.type === "application/pdf" && /pdf/.test(accept)) ||
++      (file.type.startsWith("image/") &&
++        accept.split(",").some((entry) => file.name.toLowerCase().endsWith(entry.trim()))),
++    );
++    if (!acceptsFiles) continue;
+     const dt = new DataTransfer();
+     for (const file of files) dt.items.add(file);
+     try {
+@@ -2133,7 +2194,16 @@ async function typePromptAndVerify(
        "Prompt verification failed: ChatGPT displayed the prompt but did not enable Send.",
      );
    }
@@ -351,7 +434,28 @@ index b9f5149..a8725b8 100644
  }
  
  // ---------------------------------------------------------------------------
-@@ -3844,9 +3872,7 @@ async function streamResponseSnapshots(
+@@ -3685,7 +3755,9 @@ async function streamResponseSnapshots(
+       const contract = (SITE_ADAPTER?.classifySubmittedAttachments || shared.classifySubmittedPdfContract)(
+         attachments,
+         expectedPdfFilename,
+-        expectedImageCount,
++        SITE_ADAPTER?.siteId === "chatgpt" || SITE_ADAPTER?.siteId === "gemini"
++          ? expectedImageCount
++          : 0,
+       );
+       submittedAttachmentVerified = attachmentRequested
+         ? contract.filenameMatched === true
+@@ -3742,6 +3814,9 @@ async function streamResponseSnapshots(
+       if (SITE_ADAPTER?.siteId === "gemini") {
+         throw new Error("The submitted Gemini attachments did not match the requested PDF and image count.");
+       }
++      if (SITE_ADAPTER?.siteId === "chatgpt" && expectedImageCount) {
++        throw new Error("The submitted ChatGPT message did not contain the expected attachments.");
++      }
+       if (attachmentRequested) {
+         throw new Error(
+           `The submitted user turn did not contain the requested PDF "${expectedPdfFilename}".`,
+@@ -3844,9 +3919,7 @@ async function streamResponseSnapshots(
        assistantTurn?.text ||
        deepseekAnchoredSnapshot?.answerText ||
        "";
@@ -362,7 +466,7 @@ index b9f5149..a8725b8 100644
      const domThinking =
        assistantTurn?.thinking ||
        deepseekAnchoredSnapshot?.thinkingText ||
-@@ -3995,7 +4021,10 @@ async function streamResponseSnapshots(
+@@ -3995,7 +4068,10 @@ async function streamResponseSnapshots(
        lastAssistantTurnKey = assistantTurnKey;
      }
  
@@ -374,7 +478,7 @@ index b9f5149..a8725b8 100644
        // Re-read the bound assistant turn after a final rebound delay. ChatGPT
        // can expose a prefix in the DOM long enough to satisfy visual completion
        // heuristics, especially after a discarded-tab reload.
-@@ -4008,7 +4037,10 @@ async function streamResponseSnapshots(
+@@ -4008,7 +4084,10 @@ async function streamResponseSnapshots(
          userTurnKey,
          assistantTurnKey,
        );
@@ -386,7 +490,7 @@ index b9f5149..a8725b8 100644
        const confirmedAssistantTurnKey =
          confirmedAssistantTurn?.messageKey || assistantTurnKey;
        const stableTerminalSnapshot =
-@@ -4087,8 +4119,7 @@ async function streamResponseSnapshots(
+@@ -4087,8 +4166,7 @@ async function streamResponseSnapshots(
        completion.phase !== "verified_done"
      ) {
        // Use DOM answer if available, otherwise SSE answer
@@ -396,7 +500,63 @@ index b9f5149..a8725b8 100644
        const finalThinking = lastThinkingText || sseThinking || null;
        recordTurnDebug("sse_fast_completion", {
          seq,
-@@ -4584,11 +4615,21 @@ function cloneAssistantOutput(node) {
+@@ -4546,23 +4624,52 @@ function extractResponse() {
+   return extractResponseAfter(0);
+ }
+ 
+-// Browser object URLs cannot be used by Zotero. Materialize only same-origin
+-// blob images already present in assistant output; ordinary web images keep URLs.
++// Materialize browser-local images already present in assistant output.
+ const richImageCache = new WeakMap();
+ const MAX_RICH_IMAGE_BYTES = 5 * 1024 * 1024;
++const isSvgImageDataUrl = (src) => /^data:image\/svg\+xml(?:;[^,]*)?,/i.test(src);
++
++async function rasterizeSvgAnswerImage(src) {
++  if (src.length > MAX_RICH_IMAGE_BYTES) throw new Error("SVG is too large");
++  // Decode as an image, then export a static PNG. The reply never carries
++  // executable SVG, a web widget, or the page's sandbox iframe into Zotero.
++  const image = new Image();
++  image.src = src;
++  await image.decode();
++  const edge = Math.max(image.naturalWidth, image.naturalHeight);
++  if (!edge) throw new Error("SVG has no dimensions");
++  const scale = Math.min(1920 / edge, Math.max(2, 700 / edge));
++  const canvas = document.createElement("canvas");
++  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
++  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
++  canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
++  const result = canvas.toDataURL("image/png");
++  if (!result.startsWith("data:image/png;base64,") ||
++      result.length > Math.ceil(MAX_RICH_IMAGE_BYTES / 3) * 4) {
++    throw new Error("PNG conversion failed");
++  }
++  return result;
++}
++
+ async function prepareRichOutput() {
+   const nodes = getConversationMessageNodes().filter((node) =>
+     (SITE_ADAPTER?.getMessageRole?.(node) || node.getAttribute("data-message-author-role")) === "assistant");
+   await Promise.all(nodes.map((node) => SITE_ADAPTER?.prepareRichOutput?.(node)));
+   await Promise.all(nodes.flatMap((node) => Array.from(node.querySelectorAll('img')).map(async (img) => {
+     const src = img.currentSrc || img.getAttribute('src') || '';
+-    if (!src.startsWith('blob:')) return;
++    const svgChart = SITE_ADAPTER?.siteId === "chatgpt" && isSvgImageDataUrl(src) &&
++      !img.closest("[data-code-block]");
++    if (!src.startsWith('blob:') && !svgChart) return;
+     let entry = richImageCache.get(img);
+     if (entry?.src === src) return entry.pending;
+     entry = { src, data: '', error: '' };
+     richImageCache.set(img, entry);
+     entry.pending = (async () => {
+       try {
++        if (svgChart) {
++          entry.data = await rasterizeSvgAnswerImage(src);
++          return;
++        }
+         if (new URL(src).origin !== window.location.origin) throw new Error('foreign blob');
+         const response = await fetch(src, { signal: AbortSignal.timeout(10000) });
+         if (!response.ok) throw new Error('image read failed');
+@@ -4584,19 +4691,39 @@ function cloneAssistantOutput(node) {
    const clone = node.cloneNode(true);
    const originals = Array.from(node.querySelectorAll('img'));
    const imagePairs = Array.from(clone.querySelectorAll('img'), (img, index) => [img, originals[index]]);
@@ -421,7 +581,39 @@ index b9f5149..a8725b8 100644
    });
    imagePairs.forEach(([img, original]) => {
      if (!clone.contains(img)) return;
-@@ -6948,3 +6989,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+     const src = original.currentSrc || original.getAttribute('src') || '';
+-    if (!src.startsWith('blob:')) { img.setAttribute('src', src); return; }
+     const entry = richImageCache.get(original);
+-    if (entry?.src === src && entry.data) img.setAttribute('src', entry.data);
+-    else img.replaceWith(document.createTextNode(entry?.error || 'Image is being transferred.'));
++    if (entry?.src === src && entry.data) {
++      img.setAttribute('src', entry.data);
++      if (isSvgImageDataUrl(src)) {
++        if (!img.getAttribute("alt")) img.setAttribute("alt", "ChatGPT chart");
++        const paragraph = document.createElement("p");
++        img.replaceWith(paragraph);
++        paragraph.append(img);
++      }
++    } else if (src.startsWith('blob:') || entry?.src === src) {
++      img.replaceWith(document.createTextNode(entry?.error || 'Image is being transferred.'));
++    } else {
++      img.setAttribute('src', src);
++    }
+   });
+   return clone;
+ }
+@@ -6408,7 +6535,9 @@ if (!window.__syncZoteroListenerRegistered) {
+             await attachImages(msg.images);
+             uploadDetected = true;
+           } catch (imgErr) {
+-            if (SITE_ADAPTER?.siteId === "gemini") throw imgErr;
++            if (SITE_ADAPTER?.siteId === "chatgpt" || SITE_ADAPTER?.siteId === "gemini") {
++              throw imgErr;
++            }
+             console.warn("[sync-zotero] Image attachment failed:", imgErr);
+           }
+         }
+@@ -6948,3 +7077,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
    ping();
  })();
  // --- end keepalive ---------------------------------------------------------
@@ -489,7 +681,7 @@ index 600c81c..3b3bedc 100644
          ok,
          pasteAccepted,
 diff --git a/extension/manifest.json b/extension/manifest.json
-index ee50cfc..8ac7d87 100644
+index ee50cfc..f283b50 100644
 --- a/extension/manifest.json
 +++ b/extension/manifest.json
 @@ -1,7 +1,7 @@
@@ -497,20 +689,47 @@ index ee50cfc..8ac7d87 100644
    "manifest_version": 3,
    "name": "Sync for Zotero",
 -  "version": "0.0.19",
-+  "version": "0.0.19.8",
++  "version": "0.0.19.14",
    "description": "Bridge LLM for Zotero with ChatGPT, DeepSeek and Google Gemini web chats",
    "minimum_chrome_version": "119",
    "permissions": [
+@@ -34,14 +34,27 @@
+       "run_at": "document_start"
+     },
+     {
+-      "matches": ["https://chatgpt.com/*", "https://chat.deepseek.com/*"],
+-      "js": ["injected.js"],
++      "matches": [
++        "https://chatgpt.com/*",
++        "https://chat.deepseek.com/*"
++      ],
++      "js": [
++        "injected.js"
++      ],
+       "world": "MAIN",
+       "run_at": "document_start"
+     },
+     {
+-      "matches": ["https://chatgpt.com/*", "https://chat.deepseek.com/*", "https://gemini.google.com/*"],
+-      "js": ["webchat_shared.js", "gemini_adapter.js", "content_script.js"],
++      "matches": [
++        "https://chatgpt.com/*",
++        "https://chat.deepseek.com/*",
++        "https://gemini.google.com/*"
++      ],
++      "js": [
++        "webchat_shared.js",
++        "gemini_adapter.js",
++        "content_script.js"
++      ],
+       "run_at": "document_idle"
+     }
+   ],
 diff --git a/extension/webchat_shared.js b/extension/webchat_shared.js
-index c5a06b0..73bfdc5 100644
+index c5a06b0..f987d20 100644
 --- a/extension/webchat_shared.js
 +++ b/extension/webchat_shared.js
-@@ -1,3 +1,4 @@
-+// Modified for Zotero AI Reading Bridge, November 2026.
- (function (root, factory) {
-   const api = factory();
-   root.SyncZoteroShared = api;
-@@ -17,6 +18,23 @@
+@@ -17,6 +17,23 @@
        .trim();
    }
  
@@ -534,7 +753,31 @@ index c5a06b0..73bfdc5 100644
    function composerTextMatchesPrompt(promptText, composerText) {
      const a = normalizeComposerText(promptText);
      const b = normalizeComposerText(composerText);
-@@ -1091,6 +1109,22 @@
+@@ -554,6 +571,7 @@
+   function classifySubmittedPdfContract(
+     attachments,
+     expectedFilename = "",
++    expectedImageCount = 0,
+   ) {
+     const normalizedAttachments = (Array.isArray(attachments)
+       ? attachments
+@@ -592,10 +610,11 @@
+       // the name the site renders is not something we can insist on
+       // without rejecting successful sends. Image-only turns are
+       // affirmatively missing the PDF and still fail.
+-      contractVerified: attachmentRequested
+-        ? pdfAttachments.length + unidentifiedAttachments.length > 0
+-        : pdfAttachments.length === 0 &&
+-          unidentifiedAttachments.length === 0,
++      contractVerified: normalizedAttachments.filter(isImageAttachment).length >= expectedImageCount &&
++        (attachmentRequested
++          ? pdfAttachments.length + unidentifiedAttachments.length > 0
++          : pdfAttachments.length === 0 &&
++            unidentifiedAttachments.length === 0),
+     };
+   }
+ 
+@@ -1091,6 +1110,22 @@
      };
    }
  
@@ -557,7 +800,7 @@ index c5a06b0..73bfdc5 100644
    function terminalAnswerSnapshotIsStable(candidate, latest) {
      const candidateText = normalizeComposerText(candidate?.text || "");
      const latestText = normalizeComposerText(latest?.text || "");
-@@ -1558,6 +1592,7 @@
+@@ -1558,6 +1593,7 @@
      canUseDeepSeekQuiescentCompletion,
      completionTimingForSignals,
      composerTextMatchesPrompt,
@@ -565,7 +808,7 @@ index c5a06b0..73bfdc5 100644
      composerBridgeAllowsSynchronousFallback,
      composerBridgeWriteTransition,
      composerPromptVerificationPolicy,
-@@ -1590,6 +1625,7 @@
+@@ -1590,6 +1626,7 @@
      tabNeedsActivation,
      tabNeedsLifecycleReload,
      terminalAnswerSnapshotIsStable,
@@ -658,7 +901,7 @@ index 00a9744..b6634ee 100644
 +  ), true);
 +});
 diff --git a/test/chatgpt_dom_adapter.test.mjs b/test/chatgpt_dom_adapter.test.mjs
-index 806b808..69a7c9c 100644
+index 806b808..063bbe4 100644
 --- a/test/chatgpt_dom_adapter.test.mjs
 +++ b/test/chatgpt_dom_adapter.test.mjs
 @@ -1,3 +1,5 @@
@@ -676,7 +919,7 @@ index 806b808..69a7c9c 100644
    const api = vm.runInContext(`({ adapter: SITE_ADAPTER, extractConversationTranscript,
      findStopButton, resolveBoundAssistantTurn, findMatchingUserTurn, hasResponseActionBar,
      streamResponseSnapshots, buildDiagnostic, ensureChatGPTChatMode })`, context);
-@@ -518,3 +520,37 @@ test('DeepSeek rich output completes with its transcript-derived turn key', asyn
+@@ -518,3 +520,57 @@ test('DeepSeek rich output completes with its transcript-derived turn key', asyn
    assert.equal(terminal?.runState, 'done');
    assert.equal(terminal?.text, '```svg\n<svg><circle/></svg>\n```');
  });
@@ -713,6 +956,26 @@ index 806b808..69a7c9c 100644
 +  </div>`.replace(/\n\s+/g, ""), realChatUrl);
 +  const message = page.extractConversationTranscript().messages[0];
 +  assert.equal(message.text, "论文：**The Rise and Future Demise of the World Capitalist System**\n\n作者：**Immanuel Wallerstein**（伊曼纽尔·沃勒斯坦）\n\n正文");
++});
++
++
++test('ChatGPT SVG answer card becomes a static PNG between text passages', async () => {
++  const page = content('<div data-chatgpt-search-unit-key="turn:assistant"><div data-markdown-text-style="assistant-message"><p>Before</p><img src="data:image/svg+xml,%3Csvg%3E%3C/svg%3E"><p>After</p></div></div>', realChatUrl);
++  page.context.Image = class {
++    naturalWidth = 400;
++    naturalHeight = 200;
++    async decode() {}
++  };
++  const createElement = page.document.createElement.bind(page.document);
++  let drawn = false;
++  page.document.createElement = (name, ...args) => name === 'canvas' ? {
++    getContext: () => ({ drawImage() { drawn = true; } }),
++    toDataURL: () => 'data:image/png;base64,YQ==',
++  } : createElement(name, ...args);
++  await vm.runInContext('prepareRichOutput()', page.context);
++  assert.ok(drawn);
++  assert.equal(page.extractConversationTranscript().messages[0].text,
++    'Before\n\n![ChatGPT chart](data:image/png;base64,YQ==)\n\nAfter');
 +});
 diff --git a/test/gemini_adapter.test.mjs b/test/gemini_adapter.test.mjs
 index a10909a..4d24d81 100644
@@ -835,100 +1098,18 @@ index 4958221..5f81f54 100644
      seq: 13, attempt: 1, target, delivery_contract_version: 1, prompt: "Follow up",
      expected_chat_url: expectedUrl, expected_chat_id: new URL(expectedUrl).pathname.replace(/\/$/, "").split("/").pop(), ...query,
    }) };
-diff --git a/test/background_reading.test.mjs b/test/background_reading.test.mjs
-new file mode 100644
-index 0000000..987cd51
---- /dev/null
-+++ b/test/background_reading.test.mjs
-@@ -0,0 +1,79 @@
-+import assert from "node:assert/strict";
-+import fs from "node:fs";
-+import { createRequire } from "node:module";
-+import test from "node:test";
-+import vm from "node:vm";
-+import { conversationFollowup } from "./helpers/conversation_workflow.mjs";
+diff --git a/test/pdf_attachment_contract.test.mjs b/test/pdf_attachment_contract.test.mjs
+index c50b9a0..690e1b3 100644
+--- a/test/pdf_attachment_contract.test.mjs
++++ b/test/pdf_attachment_contract.test.mjs
+@@ -875,3 +875,10 @@ test("fails closed when the website never exposes expected PDF evidence", async
+     /did not confirm/,
+   );
+ });
 +
-+const require = createRequire(import.meta.url);
-+const shared = require("../extension/webchat_shared.js");
-+
-+test("a follow-up can submit from an inactive ChatGPT tab without selecting it", async () => {
-+  const url = "https://chatgpt.com/c/11111111-2222-4333-8444-555555555555";
-+  const h = conversationFollowup({ target: "chatgpt", expectedUrl: url, initialUrl: url, active: false });
-+  await h.run({ prompt: "Selected passage: text\u0000 from the PDF\u0000." });
-+  assert.deepEqual(h.errors, []);
-+  assert.equal(h.sent[0]?.prompt, "Selected passage: text from the PDF.");
-+  assert.equal(h.sent.length, 1);
-+  assert.equal(h.tabUpdates.some((update) => update.active === true), false);
-+  assert.equal(h.tabUpdates.some((update) => update.autoDiscardable === false), true);
++test("a requested screenshot must be present in the submitted ChatGPT turn", () => {
++  assert.equal(shared.classifySubmittedPdfContract([], "", 1).contractVerified, false);
++  assert.equal(shared.classifySubmittedPdfContract(["image"], "", 1).contractVerified, true);
++  assert.equal(shared.classifySubmittedPdfContract(["paper.pdf"], "paper.pdf", 1).contractVerified, false);
++  assert.equal(shared.classifySubmittedPdfContract(["paper.pdf", "image"], "paper.pdf", 1).contractVerified, true);
 +});
-+
-+test("background-rendered prefix uses the complete matching transport answer", () => {
-+  assert.equal(shared.selectCompleteAnswerText("The paper argues", "The paper argues that institutions matter."), "The paper argues that institutions matter.");
-+  assert.equal(shared.selectCompleteAnswerText("The paper\nargues", "The paper argues that institutions matter."), "The paper argues that institutions matter.");
-+  assert.equal(shared.selectCompleteAnswerText("A different answer", "The paper argues that institutions matter."), "A different answer");
-+  assert.equal(shared.selectCompleteAnswerText("The complete DOM answer", "The complete"), "The complete DOM answer");
-+  assert.equal(shared.selectCompleteAnswerText("", "The complete stream answer"), "The complete stream answer");
-+});
-+
-+test("concurrent heartbeat kicks share one probe and recover after a failure", async () => {
-+  const source = fs.readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
-+  const start = source.indexOf("let heartbeatInFlight = null;");
-+  const end = source.indexOf("// Heartbeat: checks connectivity", start);
-+  let count = 0;
-+  let rejectProbe;
-+  const context = vm.createContext({ checkHeartbeat: () => {
-+    count++;
-+    return new Promise((_resolve, reject) => { rejectProbe = reject; });
-+  } });
-+  vm.runInContext(source.slice(start, end), context);
-+  const first = context.heartbeat();
-+  assert.equal(context.heartbeat(), first);
-+  assert.equal(count, 1);
-+  rejectProbe(new Error("probe unavailable"));
-+  await assert.rejects(first, /probe unavailable/);
-+  const next = context.heartbeat();
-+  assert.notEqual(next, first);
-+  assert.equal(count, 2);
-+  rejectProbe(new Error("probe unavailable"));
-+  await assert.rejects(next, /probe unavailable/);
-+});
-+
-+test("port rediscovery completes when initiated by an in-flight heartbeat", async () => {
-+  const source = fs.readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
-+  const start = source.indexOf("let _portDiscoveryInFlight = false;");
-+  const end = source.indexOf("// Discover port on startup", start);
-+  let requests = 0;
-+  const context = vm.createContext({
-+    SERVER: "http://localhost:23119/llm-for-zotero/webchat",
-+    RELAY_HOSTS: ["127.0.0.1"],
-+    HEARTBEAT_REQUEST_TIMEOUT_MS: 4000,
-+    zoteroConnected: true,
-+    console: { log() {} },
-+    AbortSignal,
-+    relayFetch: async (url) => {
-+      requests++;
-+      if (url.endsWith("/debug")) return { ok: true, json: async () => ({ status: "idle" }) };
-+      return { ok: false };
-+    },
-+  });
-+  const discovery = source.slice(start, end).replace(
-+    /function resetExtensionState\(\) \{[\s\S]*?\n\}/,
-+    "function resetExtensionState() {}",
-+  );
-+  vm.runInContext(discovery, context);
-+  await context.heartbeat();
-+  assert.equal(context.SERVER, "http://127.0.0.1:23119/llm-for-zotero/webchat");
-+  assert.equal(requests, 2);
-+});
-diff --git a/test/helpers/content_source.mjs b/test/helpers/content_source.mjs
-new file mode 100644
-index 0000000..8522d7b
---- /dev/null
-+++ b/test/helpers/content_source.mjs
-@@ -0,0 +1,6 @@
-+// White-box fixtures access content-script internals in their VM context.
-+export function unwrapContentSource(source) {
-+  const body = source.indexOf("// Utility helpers");
-+  const end = source.lastIndexOf("globalThis.syncZoteroContentIsCurrent =");
-+  return source.slice(body, end);
-+}

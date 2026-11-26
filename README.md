@@ -1,5 +1,10 @@
 # Zotero AI Reading Bridge
 
+[中文](#chinese) · [English](#english)
+
+<a name="chinese"></a>
+## 中文
+
 **最新版 [v0.2.1](../../releases/tag/v0.2.1)** 将 ChatGPT 回复里的 SVG 图表卡片转为 PNG，按正文原顺序显示在 Zotero 侧栏。支持 HTML 快照阅读。
 
 在 Zotero 里读 PDF 时，点击阅读器的 **AI** 按钮即可把问题发给浏览器中的 ChatGPT。插件会附上当前页图像，并在可提取时补上页内文字和选中的段落。每篇 PDF 首次绑定到一个会话时会上传全文。同一会话中继续阅读同一份 PDF 时，通常只需发送当前页和问题。切换论文或主动开启新会话时，会重新发送 PDF。
@@ -38,3 +43,32 @@ Zotero 的构建产物在 `llm-for-zotero/.scaffold/build/llm-for-zotero.xpi`。
 
 - **LLM for Zotero** 的基础版本为 [v3.9.16](https://github.com/yilewang/llm-for-zotero/tree/v3.9.16)（`e055322`），作者为 Yile Wang。本项目对该部分的改动沿用 [AGPL-3.0-or-later](AGPL-3.0.txt)。修改涉及阅读器按钮、PDF 页抓取、论文与会话绑定以及相关测试。
 - **Sync for Zotero** 的基础版本为 [v0.0.19](https://github.com/yilewang/sync-for-zotero/tree/v0.0.19)（`75ed6e0`），沿用 [Apache-2.0](Apache-2.0.txt)。本项目修改了扩展版本、后台中继、输入适配、回答校验以及相关测试。
+
+---
+
+<a name="english"></a>
+## English
+
+**Latest release: [v0.2.1](../../releases/tag/v0.2.1).** ChatGPT SVG chart cards are rendered as PNG in their original positions in the Zotero sidebar. HTML snapshots are supported.
+
+Press **AI** in Zotero's PDF reader to send a question to ChatGPT in your browser. The bridge attaches a page image, extractable page text, and any selected passage. It sends the full PDF the first time a paper is bound to a conversation. Follow-ups in the same conversation usually need only the current page and question; changing papers or starting a new conversation sends the full PDF again.
+
+This is an unofficial combination of [LLM for Zotero](https://github.com/yilewang/llm-for-zotero) and [Sync for Zotero](https://github.com/yilewang/sync-for-zotero). Install both components.
+
+### Install and use
+
+1. Download the [Zotero XPI](../../releases/download/v0.2.0/LLM-for-Zotero-3.9.16.20261120.2.xpi) and install it with the gear menu under **Tools → Plugins**. It shares the upstream plugin ID, so it replaces the upstream copy. You can disable auto-updates for this plugin to keep upstream releases from overwriting the customization.
+2. Extract the [browser extension 0.0.19.14](Sync-for-Zotero-0.0.19.14.zip). Open `edge://extensions` or `chrome://extensions`, enable developer mode, and load the extracted `extension` folder unpacked. Disable any older Sync for Zotero extension to prevent it from processing the same requests.
+3. Sign in to ChatGPT and select **WebChat** and ChatGPT in LLM for Zotero settings. Open a PDF, click **AI**, wait for **Ready**, and send the question. Continue from the same conversation as you turn pages; switch Zotero PDF tabs before asking about a different paper.
+
+### Privacy, build, and compatibility
+
+The selected web chat service receives your question, the page image, extractable text and selection, and the full PDF when a conversation is first bound. Upload only material you have permission to share. The bridge connects locally to Zotero and inherits upstream browser permissions for ChatGPT, DeepSeek, and Gemini. The live reading workflow was verified with Zotero on macOS and ChatGPT in Edge.
+
+The [source ZIP](LLM-for-Zotero-3.9.16.20261108-source.zip) contains the full Zotero plugin build source, scripts, and lockfiles, omitting upstream demo images. Extract it and run `npm ci && npm run build`, or follow the patch commands in the Chinese section with Git, Node.js 24, and npm. The XPI is at `llm-for-zotero/.scaffold/build/llm-for-zotero.xpi`; you can load `sync-for-zotero/extension/` unpacked. See the [checksums](SHA256SUMS-v0.2.1).
+
+This release passed 10 Zotero reading-context tests and 300 browser-extension tests, including SVG-to-PNG regression coverage. Recovery after system sleep and parity across other browsers or chat services remain unverified. Changes to a web chat interface may affect compatibility.
+
+### Upstream and licenses
+
+LLM for Zotero [v3.9.16](https://github.com/yilewang/llm-for-zotero/tree/v3.9.16), by Yile Wang, and the related modifications are [AGPL-3.0-or-later](AGPL-3.0.txt). Sync for Zotero [v0.0.19](https://github.com/yilewang/sync-for-zotero/tree/v0.0.19) and its modifications are [Apache-2.0](Apache-2.0.txt). The patches cover reader controls, page capture and conversation binding, the browser relay, input, response verification, and tests.
